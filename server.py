@@ -7,6 +7,7 @@ import re
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 from typing import List, Optional
 
 import numpy as np
@@ -120,8 +121,21 @@ def _vlm_chat(prompt: str, jpeg: bytes, max_tokens: int = 60,
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        payload = json.loads(resp.read().decode())
+    # A bare "it failed" is useless here, because the caller silently falls back and
+    # the user just sees a plausible answer with no API call behind it. Fireworks puts
+    # the actual cause (bad model id, no image support, out of credit) in the body.
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:
+            detail = "(no body)"
+        raise RuntimeError(f"Fireworks HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Fireworks unreachable: {e.reason}") from None
+
     return payload["choices"][0]["message"]["content"].strip()
 
 
@@ -178,6 +192,33 @@ VLM_SCENE_PROMPT = (
 )
 
 
+def _ask_with_vision(build_prompt, frame_jpeg, label, **kw):
+    """Runs the VLM if it possibly can, and says out loud why if it can't.
+
+    The fallback to text-only is the right behaviour — a walking aid must not go dark
+    because an API did — but a *silent* fallback is how you end up staring at a
+    plausible answer wondering why nothing ever reached Fireworks. There are three
+    separate ways to land in the text path and from the outside they look identical,
+    so every one of them gets named, logged, and returned to the client.
+
+    Returns (raw_text_or_None, source, reason).
+    """
+    if not VISION_ENABLED:
+        reason = "no FIREWORKS_API_KEY on the server"
+    elif not frame_jpeg:
+        reason = "no live camera frame (is the camera running?)"
+    else:
+        try:
+            raw = _vlm_chat(build_prompt(True), frame_jpeg, **kw)
+            print(f"[vision] {label}: answered from the image ({len(frame_jpeg)} byte frame)")
+            return raw, "vlm", None
+        except Exception as e:
+            reason = str(e)
+
+    print(f"[vision] {label}: FELL BACK to text-only: {reason}")
+    return None, "text", reason
+
+
 def _scene_from_labels(objects) -> Optional[str]:
     """The original summary: the LLM never sees the image, it guesses an environment
     from a bag of class names. Kept as the fallback when no VLM is configured."""
@@ -215,19 +256,18 @@ def analyze_scene():
         stale = (time.time() - latest_frame_at) > 5.0
 
     if frame_jpeg is None or stale:
-        return {"success": False, "message": "No live camera frame."}
+        return {"success": False, "message": "No live camera frame. Start the camera first."}
 
-    text = None
-    if VISION_ENABLED:
-        try:
-            text = _vlm_chat(VLM_SCENE_PROMPT, frame_jpeg, max_tokens=120)
-        except Exception:
-            text = None  # fall through to labels rather than go silent
+    # The scene prompt has no text-only variant — without an image there is nothing to
+    # describe, so that path goes to _scene_from_labels instead of a reworded prompt.
+    text, source, reason = _ask_with_vision(
+        lambda _has_image: VLM_SCENE_PROMPT, frame_jpeg, "scene", max_tokens=120,
+    )
 
     if text is None:
         text = _scene_from_labels(objs)
     if not text:
-        return {"success": False, "message": "Scene analysis unavailable."}
+        return {"success": False, "message": f"Scene analysis unavailable ({reason})."}
 
     clean_text = text.strip().replace('"', '').replace('*', '').replace('#', '')
     if not clean_text:
@@ -236,7 +276,8 @@ def analyze_scene():
     with state_lock:
         global_scene_context = clean_text
 
-    return {"success": True, "summary": clean_text, "objects": objs}
+    return {"success": True, "summary": clean_text, "objects": objs,
+            "source": source, "reason": reason}
 
 
 @app.on_event("startup")
@@ -588,18 +629,10 @@ def ai_assist(payload: AiQuery):
     # it: "what does that sign say" and "are there steps" are unanswerable from a
     # list of COCO labels. It costs a second or two, which is fine here; the user
     # asked a question and is waiting. It would not be fine on the Guide Me path.
-    raw = None
-    if VISION_ENABLED and frame_jpeg:
-        try:
-            raw = _vlm_chat(
-                _build_assist_prompt(payload.query, seen, scene, has_image=True),
-                frame_jpeg,
-                max_tokens=200,
-                temperature=0.3,
-                json_mode=True,
-            )
-        except Exception:
-            raw = None  # fall through to the text-only assistant
+    raw, source, reason = _ask_with_vision(
+        lambda has_image: _build_assist_prompt(payload.query, seen, scene, has_image),
+        frame_jpeg, "ai_assist", max_tokens=200, temperature=0.3, json_mode=True,
+    )
 
     try:
         if raw is None:
@@ -626,6 +659,9 @@ def ai_assist(payload: AiQuery):
             "response": response,
             "intent": parsed["intent"],
             "destination": parsed["destination"],
+            # "vlm" = it looked at the photo. "text" = it did not, and reason says why.
+            "source": source,
+            "reason": reason,
         }
     except Exception as e:
         return {"success": False, "message": str(e)}

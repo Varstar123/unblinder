@@ -421,6 +421,14 @@ export default function App() {
     setDebugLogs((prev) => [`[${stamp}] ${message}`, ...prev.slice(0, 49)])
   }
 
+  // Every VLM-backed route says whether it actually looked at the photo, and if not,
+  // why not. Surfacing that here is the difference between "the assistant is a bit
+  // vague today" and "no request has ever reached Fireworks and here is the reason".
+  function logVisionSource(label, data) {
+    if (data.source === 'vlm') logToConsole(`[${label}]: answered FROM THE IMAGE (Fireworks VLM)`)
+    else if (data.reason) logToConsole(`[${label}]: NO VISION — ${data.reason}`)
+  }
+
   function beginAction(name) {
     actionIdRef.current += 1
     const id = actionIdRef.current
@@ -649,7 +657,10 @@ export default function App() {
       const data = await res.json()
       if (isStaleAction(id)) return
 
+      logVisionSource('OBJECTS', data)
+
       if (!data.success || !data.summary) {
+        logToConsole(`[OBJECTS]: ${data.message || 'scene analysis failed'}`)
         speakFallback()
         return
       }
@@ -808,6 +819,8 @@ export default function App() {
       })
       const data = await res.json()
       if (isStaleAction(id)) return
+
+      logVisionSource('AI ASSISTANT', data)
 
       if (!data.success || !data.response) {
         audioQueue.speakExplicit(["AI Assistant connection error."], 1.1, voiceEnabledRef, release)
