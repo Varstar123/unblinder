@@ -244,6 +244,49 @@ def _scene_from_labels(objects) -> Optional[str]:
         return None
 
 
+# The guidance loop calls this every few seconds while Guide Me is on, so it must be
+# terse and it must SHUT UP when there is nothing wrong. A hazard scanner that says
+# "the path is clear" every seven seconds is just a loop of noise the user has to
+# talk over — so the model is given an explicit way to say nothing: the word CLEAR.
+VLM_HAZARD_PROMPT = (
+    "You are watching the ground ahead for a blind person who is walking right now.\n"
+    "Look ONLY for things that could hurt them within their next few steps: a pit or open "
+    "hole, a missing drain cover, broken or uneven pavement, a step or kerb up or down, a "
+    "staircase, a puddle or wet floor, a barrier or roadworks, a vehicle blocking the way, "
+    "or the footpath ending, narrowing, or being blocked.\n"
+    "If you see none of those and the way ahead is walkable, reply with exactly one word: CLEAR\n"
+    "Otherwise reply with ONE spoken warning, under 12 words, second person, naming the "
+    "hazard and which side it is on. No markdown, no preamble, no reassurance."
+)
+
+
+@app.post("/api/hazards")
+def scan_hazards():
+    """Underfoot hazard check for the active guidance loop. Returns hazard=False far more
+    often than True, and the caller is expected to stay silent when it does."""
+    with state_lock:
+        frame_jpeg = latest_frame_jpeg
+        stale = (time.time() - latest_frame_at) > 5.0
+
+    if frame_jpeg is None or stale:
+        return {"success": False, "hazard": False, "source": "text",
+                "reason": "no live camera frame (is the camera running?)"}
+
+    text, source, reason = _ask_with_vision(
+        lambda _has_image: VLM_HAZARD_PROMPT, frame_jpeg, "hazards", max_tokens=40,
+    )
+    if text is None:
+        return {"success": False, "hazard": False, "source": source, "reason": reason}
+
+    clean = text.strip().strip('."').replace("*", "").replace("#", "")
+    # Anything that starts with CLEAR is a no-op. Checking the prefix rather than equality
+    # because models like to append a full stop or a stray word however firmly you ask.
+    if not clean or clean.upper().startswith("CLEAR"):
+        return {"success": True, "hazard": False, "alert": None, "source": source}
+
+    return {"success": True, "hazard": True, "alert": clean, "source": source}
+
+
 @app.post("/api/scene")
 def analyze_scene():
     """One-shot scene analysis. This is the Objects button, and it is the only thing

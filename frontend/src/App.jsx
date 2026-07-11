@@ -291,6 +291,44 @@ function computeTargetBearing(lat1, lon1, lat2, lon2) {
   return (brng + 360) % 360
 }
 
+// Shortest distance from the user to the route line itself, in metres.
+//
+// Distance to the next checkpoint is not the same question: you can be twenty metres
+// from the next corner while standing in the middle of the road, or on the wrong side
+// of a fence. Drifting off the path is about the whole polyline, not one point on it.
+//
+// Projects to a local flat plane centred on the user. Over a few hundred metres the
+// curvature error is centimetres, and it makes this a plain point-to-segment problem.
+function distanceToRouteMeters(lat, lon, geometry) {
+  const pts = geometry && geometry.coordinates
+  if (!pts || pts.length < 2) return null
+
+  const R = 6371000
+  const cosLat = Math.cos(lat * Math.PI / 180)
+  const toXY = (la, lo) => [
+    (lo - lon) * Math.PI / 180 * cosLat * R,
+    (la - lat) * Math.PI / 180 * R,
+  ]
+
+  let best = Infinity
+  for (let i = 0; i < pts.length - 1; i++) {
+    // GeoJSON is [lon, lat].
+    const [ax, ay] = toXY(pts[i][1], pts[i][0])
+    const [bx, by] = toXY(pts[i + 1][1], pts[i + 1][0])
+
+    const dx = bx - ax
+    const dy = by - ay
+    const len2 = dx * dx + dy * dy
+
+    // The user sits at the origin, so this is the distance from (0,0) to segment AB.
+    let t = len2 === 0 ? 0 : -(ax * dx + ay * dy) / len2
+    t = Math.max(0, Math.min(1, t))
+    const d = Math.hypot(ax + t * dx, ay + t * dy)
+    if (d < best) best = d
+  }
+  return best
+}
+
 function computeTurnDirection(angleDiff) {
   if (Math.abs(angleDiff) <= 20) return 'straight'
   return angleDiff > 0 ? 'right' : 'left'
@@ -319,6 +357,33 @@ const DANGER_STEPS = 3
 // flicker would read as "left and came back" and re-fire the warning, which is
 // exactly the loop we are removing. It must outlast a dropped frame, not a real exit.
 const REARM_AFTER_ABSENT_MS = 2000
+
+// ==========================================
+// CONTINUOUS GUIDANCE
+// ==========================================
+// Guide Me is a mode, not a sentence. Once on, it stays on until the user arrives or
+// presses it again, and it watches three things the one-shot briefing could not:
+// what is underfoot, whether they have wandered off the path, and whether they are
+// walking in the wrong direction entirely.
+//
+// Every threshold below exists to stop a warning becoming a nag. A blind user cannot
+// look away from audio — anything that repeats needlessly has to be talked over, and
+// an aid people talk over is an aid people switch off.
+const HAZARD_SCAN_MS = 7000        // how often the camera is checked for pits, kerbs, steps
+const HAZARD_REPEAT_MS = 15000     // the same hazard is not re-announced inside this window
+const BRIEFING_MS = 25000          // routine "turn left in 30 metres" cadence
+
+const OFF_ROUTE_M = 25             // drifted this far from the route line: say so
+const BACK_ON_ROUTE_M = 12         // and only call them back on once clearly back
+                                   // (the gap between these two is hysteresis — without
+                                   // it, hovering at the boundary would alternate
+                                   // "off route"/"back on route" forever)
+
+const HEADING_TOLERANCE_DEG = 50   // facing further off than this counts as wrong way
+const HEADING_SUSTAIN_MS = 6000    // ...but only after holding it this long. A phone
+                                   // compass swings hard with every footfall, so warning
+                                   // on a single reading would fire almost continuously.
+const ARRIVAL_M = 12               // close enough to a checkpoint to call it reached
 
 function buildObjectsNarration(objs) {
   if (!objs || objs.length === 0) return "No objects currently detected in view."
@@ -359,8 +424,16 @@ export default function App() {
   const [deviceHeading, setDeviceHeading] = useState(0)
   const [debugLogs, setDebugLogs] = useState(["[Console Bootup Complete] Waiting for coordinates input..."])
 
-  const [activeAction, setActiveAction] = useState(null) 
+  const [activeAction, setActiveAction] = useState(null)
   const [speechState, setSpeechState] = useState({ isPlaying: false, priority: null })
+
+  // Continuous guidance mode: on until arrival, or until the button is pressed again.
+  const [guiding, setGuiding] = useState(false)
+  const guidingRef = useRef(false)
+  const offRouteLatchRef = useRef(false)
+  const headingLatchRef = useRef({ since: 0, warned: false })
+  const hazardLatchRef = useRef({ text: '', at: 0 })
+  const hazardInFlightRef = useRef(false)
   
   // VOICE RECOGNITION (AI ASSISTANT) STATE
   const [theme, setTheme] = useState(() => {
@@ -526,6 +599,7 @@ export default function App() {
         setCurrentPosition(coords)
         if (navRouteDataRef.current && navRouteDataRef.current.checkpoints) {
           evaluateProactivePathStep(coords)
+          evaluateDeviation(coords)
         }
       },
       (err) => logToConsole(`GPS Hardware Error: ${err.message}`),
@@ -534,41 +608,88 @@ export default function App() {
     return () => navigator.geolocation.clearWatch(watchId)
   }, [])
 
+  // Advances the route as checkpoints are passed. The checkpoint list advances whether
+  // or not guidance is on, so the map stays truthful — but it only speaks while guiding,
+  // because an app that calls out turns you never asked for is an app talking to itself.
   function evaluateProactivePathStep(userCoords) {
     const route = navRouteDataRef.current
     if (!route || !route.checkpoints || route.checkpoints.length === 0) return
+
     const nextPt = route.checkpoints[0]
     const distanceToNext = computeHaversineDistance(userCoords.lat, userCoords.lon, nextPt.lat, nextPt.lon)
+    if (distanceToNext > ARRIVAL_M) return
 
-    if (distanceToNext <= 12) {
-      const turnAlert = `Navigation update. Approach path shift. ${nextPt.instruction} onto ${nextPt.name}.`
-      audioQueue.speakAmbient(turnAlert, 1.1, voiceEnabledRef)
-      logToConsole(`[AUTO PROACTIVE TRIGGER]: ${turnAlert}`)
-      setNavRouteData((prev) => {
-        if (!prev || !prev.checkpoints) return prev
-        const remaining = prev.checkpoints.slice(1)
-        if (remaining.length === 0) {
-          audioQueue.speakAmbient("Destination reached.", 1.1, voiceEnabledRef)
-          setIsNavigating(false)
-        }
-        return { ...prev, checkpoints: remaining }
-      })
+    const remaining = route.checkpoints.slice(1)
+    const updated = { ...route, checkpoints: remaining }
+    navRouteDataRef.current = updated
+    setNavRouteData(updated)
+
+    if (remaining.length === 0) {
+      setIsNavigating(false)
+      logToConsole('[GUIDE]: destination reached.')
+      if (guidingRef.current) {
+        stopGuiding('You have reached your destination. Guidance is now off.')
+      }
+      return
     }
+
+    if (!guidingRef.current) return
+    const turnAlert = `${nextPt.instruction} onto ${nextPt.name}.`
+    logToConsole(`[GUIDE]: checkpoint reached — ${turnAlert}`)
+    audioQueue.speakExplicit([turnAlert], 1.1, voiceEnabledRef)
   }
 
-  async function handleGuideMeButton() {
-    const id = beginAction('guide')
+  // Two ways to go wrong that the turn-by-turn cannot catch: walking off the path
+  // altogether, and walking the right path in the wrong direction.
+  function evaluateDeviation(userCoords) {
+    if (!guidingRef.current) return
+    const route = navRouteDataRef.current
+    if (!route || !route.checkpoints || route.checkpoints.length === 0) return
+
+    // 1. Have they left the path? (Distance to the route LINE, not to the next corner.)
+    const off = distanceToRouteMeters(userCoords.lat, userCoords.lon, route.geometry)
+    if (off != null) {
+      if (off > OFF_ROUTE_M && !offRouteLatchRef.current) {
+        offRouteLatchRef.current = true
+        logToConsole(`[GUIDE]: OFF ROUTE by ${Math.round(off)}m`)
+        audioQueue.speakExplicit(
+          [`Careful. You have drifted about ${Math.round(off)} meters off the path. Stop, and turn slowly until I tell you that you are back on it.`],
+          1.1, voiceEnabledRef)
+      } else if (off < BACK_ON_ROUTE_M && offRouteLatchRef.current) {
+        offRouteLatchRef.current = false
+        logToConsole('[GUIDE]: back on route.')
+        audioQueue.speakExplicit(['You are back on the path.'], 1.1, voiceEnabledRef)
+      }
+    }
+
+    // 2. Are they facing the wrong way? Only after holding it — see HEADING_SUSTAIN_MS.
+    const target = route.checkpoints[0]
+    const bearing = computeTargetBearing(userCoords.lat, userCoords.lon, target.lat, target.lon)
+    const diff = normalizeAngleDiff(bearing, deviceHeadingRef.current)
+    const now = Date.now()
+    const h = headingLatchRef.current
+
+    if (Math.abs(diff) <= HEADING_TOLERANCE_DEG) {
+      headingLatchRef.current = { since: 0, warned: false }
+      return
+    }
+    if (!h.since) h.since = now
+    if (h.warned || now - h.since < HEADING_SUSTAIN_MS) return
+
+    h.warned = true
+    const dir = diff > 0 ? 'right' : 'left'
+    logToConsole(`[GUIDE]: heading off by ${Math.round(diff)}°`)
+    audioQueue.speakExplicit(
+      [`You are walking away from your route. Turn ${dir}, about ${Math.round(Math.abs(diff))} degrees.`],
+      1.1, voiceEnabledRef)
+  }
+
+  // Speaks the fused turn + obstacle briefing once. Called on activation and then on a
+  // slow cadence while guiding. Stays on Groq: this is the latency-critical path.
+  async function speakBriefing({ explicit = true } = {}) {
     const user = currentPositionRef.current
     const route = navRouteDataRef.current
-
-    if (!user) {
-      audioQueue.speakExplicit(["GPS tracking not acquired yet."], 1.1, voiceEnabledRef, () => finishAction(id))
-      return
-    }
-    if (!route || !route.checkpoints || route.checkpoints.length === 0) {
-      audioQueue.speakExplicit(["No destination is set."], 1.1, voiceEnabledRef, () => finishAction(id))
-      return
-    }
+    if (!user || !route || !route.checkpoints || route.checkpoints.length === 0) return
 
     const targetNode = route.checkpoints[0]
     const distanceMeters = computeHaversineDistance(user.lat, user.lon, targetNode.lat, targetNode.lon)
@@ -577,6 +698,14 @@ export default function App() {
     const angleDiff = normalizeAngleDiff(bearing, heading)
     const turnDirection = computeTurnDirection(angleDiff)
     const fallbackText = buildFallbackGuidance(targetNode, distanceMeters, turnDirection, angleDiff, route.checkpoints.length)
+
+    const say = (text) => {
+      // Routine re-briefings go out as ambient, so an obstacle or hazard warning can cut
+      // straight through them. The first briefing on activation is explicit: the user
+      // just pressed the button and is waiting to hear something.
+      if (explicit) audioQueue.speakExplicit([text], 1.1, voiceEnabledRef)
+      else audioQueue.speakAmbient(text, 1.1, voiceEnabledRef)
+    }
 
     try {
       const res = await fetch(`${BACKEND}/api/briefing`, {
@@ -602,19 +731,109 @@ export default function App() {
         })
       })
       const data = await res.json()
-      if (isStaleAction(id)) return 
-
       if (data.success && data.briefing) {
-        logToConsole(`[GUIDE ME · AI FUSED]: ${data.briefing}`)
-        audioQueue.speakExplicit([data.briefing], 1.1, voiceEnabledRef, () => finishAction(id))
+        logToConsole(`[GUIDE]: ${data.briefing}`)
+        say(data.briefing)
       } else {
-        audioQueue.speakExplicit([fallbackText], 1.1, voiceEnabledRef, () => finishAction(id))
+        say(fallbackText)
       }
     } catch (err) {
-      if (isStaleAction(id)) return
-      audioQueue.speakExplicit([fallbackText], 1.1, voiceEnabledRef, () => finishAction(id))
+      say(fallbackText)
     }
   }
+
+  // Checks what is underfoot. Only speaks when there is actually something wrong —
+  // the backend answers CLEAR most of the time and we stay quiet on that.
+  async function scanHazards() {
+    if (!guidingRef.current || !runningRef.current) return
+    if (hazardInFlightRef.current) return
+
+    hazardInFlightRef.current = true
+    try {
+      const res = await fetch(`${BACKEND}/api/hazards`, { method: 'POST' })
+      const data = await res.json()
+      if (!guidingRef.current) return
+
+      if (!data.hazard || !data.alert) {
+        if (data.reason) logToConsole(`[HAZARD]: no vision — ${data.reason}`)
+        return
+      }
+
+      // The pothole is still a pothole four seconds later. Say it once, then let it rest
+      // — unless it is still there after HAZARD_REPEAT_MS, by which point a walker who
+      // has not reacted deserves reminding.
+      const last = hazardLatchRef.current
+      const now = Date.now()
+      if (data.alert === last.text && now - last.at < HAZARD_REPEAT_MS) return
+      hazardLatchRef.current = { text: data.alert, at: now }
+
+      logToConsole(`[HAZARD]: ${data.alert}`)
+      audioQueue.speakExplicit([data.alert], 1.15, voiceEnabledRef)
+    } catch (err) {
+      // A dropped request is not worth announcing; the next tick retries in seconds.
+    } finally {
+      hazardInFlightRef.current = false
+    }
+  }
+
+  function stopGuiding(message) {
+    guidingRef.current = false
+    setGuiding(false)
+    offRouteLatchRef.current = false
+    headingLatchRef.current = { since: 0, warned: false }
+    hazardLatchRef.current = { text: '', at: 0 }
+    logToConsole('[GUIDE]: guidance stopped.')
+    audioQueue.clearAll()
+    if (message) audioQueue.speakExplicit([message], 1.1, voiceEnabledRef)
+  }
+
+  // Guide Me is a mode, not a sentence. Press once to start, again to stop, again to
+  // start — and it stays on by itself until the destination is reached.
+  function handleGuideMeButton() {
+    if (guidingRef.current) {
+      stopGuiding('Guidance stopped.')
+      return
+    }
+
+    if (!currentPositionRef.current) {
+      audioQueue.speakExplicit(['GPS is not acquired yet.'], 1.1, voiceEnabledRef)
+      return
+    }
+    const route = navRouteDataRef.current
+    if (!route || !route.checkpoints || route.checkpoints.length === 0) {
+      audioQueue.speakExplicit(['No destination is set. Set a destination first.'], 1.1, voiceEnabledRef)
+      return
+    }
+
+    guidingRef.current = true
+    setGuiding(true)
+    offRouteLatchRef.current = false
+    headingLatchRef.current = { since: 0, warned: false }
+    hazardLatchRef.current = { text: '', at: 0 }
+    logToConsole('[GUIDE]: continuous guidance started.')
+
+    // Hazard scanning is the one part that needs the camera. Navigation still works
+    // without it, so say what is missing rather than refusing to guide at all.
+    if (!runningRef.current) {
+      logToConsole('[GUIDE]: camera is off — no hazard scanning.')
+      audioQueue.speakExplicit(
+        ['Guiding you now. The camera is off, so I cannot warn you about the ground ahead. Start the camera for that.'],
+        1.1, voiceEnabledRef)
+    }
+    speakBriefing({ explicit: runningRef.current })
+  }
+
+  // The guidance loop. Only alive while guiding, so nothing here runs — and no VLM call
+  // is ever made — unless the user has actually asked to be guided.
+  useEffect(() => {
+    if (!guiding) return
+    const hazardTimer = setInterval(scanHazards, HAZARD_SCAN_MS)
+    const briefTimer = setInterval(() => speakBriefing({ explicit: false }), BRIEFING_MS)
+    return () => {
+      clearInterval(hazardTimer)
+      clearInterval(briefTimer)
+    }
+  }, [guiding])
 
   // Fires once when something comes within DANGER_STEPS, then stays quiet for as long
   // as it is on screen. See the constants above for why it latches rather than repeats.
@@ -858,6 +1077,9 @@ export default function App() {
     setDestinationInput(target)
     setNavRouteData(null)
     setIsNavigating(false)
+    // A new destination invalidates the route we were guiding along, so guidance has to
+    // end here rather than keep steering the user toward the old one.
+    if (guidingRef.current) stopGuiding()
 
     const speak = (lines) => audioQueue.speakExplicit([...spokenPrefix, ...lines], 1.1, voiceEnabledRef, onSpoken)
 
@@ -1125,14 +1347,17 @@ export default function App() {
   const primaryActions = [
     {
       id: 'guide',
-      spine: 'Guide',
+      spine: guiding ? 'Guiding' : 'Guide',
       glyph: <IconCompass />,
-      title: 'Guide Me',
-      description: 'Fuses live obstacles with your route, then speaks the next turn, the distance to it, and the path ahead.',
-      idle: 'Turn · Distance · Path',
-      ariaLabel: 'Guide me: get spoken navigation directions',
+      title: guiding ? 'Guiding…' : 'Guide Me',
+      description: guiding
+        ? 'Guiding you to your destination. Watching for obstacles, hazards underfoot, and drifting off the path. Tap again to stop.'
+        : 'Guides you continuously to your destination — turns, obstacles, hazards, and warnings if you wander off the path. Tap again to stop.',
+      idle: guiding ? 'Active · Tap to stop' : 'Turn · Hazards · Path',
+      ariaLabel: guiding ? 'Stop guidance' : 'Guide me: start continuous spoken navigation',
       onClick: handleGuideMeButton,
-      disabled: activeAction === 'guide',
+      // Never disabled: the button has to remain pressable in order to stop guidance.
+      disabled: false,
       tint: { '--ub-glow': 'rgba(2,132,199,0.55)', '--ub-soft': 'rgba(2,132,199,0.17)', '--ub-base': '#0b3a5d', '--ub-deep': '#06213a', '--ub-status': '#bae6fd' },
     },
     {
@@ -1247,10 +1472,13 @@ return (
           {primaryActions.map((action, i) => {
             const busy = activeAction === action.id
             const listening = action.id === 'ai_assist' && isListening
+            const active = action.id === 'guide' && guiding
             const status = buttonStatusLabel(action.id) || action.idle
             const classes = ['ub-panel']
-            if (busy || listening) classes.push('is-open')
+            if (busy || listening || active) classes.push('is-open')
             if (listening) classes.push('is-listening')
+            // Guidance runs for minutes with no other visual cue that it is on.
+            if (active) classes.push('is-guiding')
 
             return (
               <button
