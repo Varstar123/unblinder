@@ -12,10 +12,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from ultralytics import YOLO
 import cv2
 from groq import Groq
 from dotenv import load_dotenv
+
+from detector import Detector
 
 load_dotenv()
 
@@ -30,12 +31,12 @@ app.add_middleware(
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-MODEL_PATH = os.environ.get("YOLO_MODEL", "yolo11n.pt")
+MODEL_PATH = os.environ.get("YOLO_MODEL", "yolo11n.onnx")
 
 # The camera lives in the user's browser, not on this server. Frames arrive over
 # the /ws socket, get detected on, and the results go straight back down the same
 # socket. Nothing here ever touches a local capture device.
-model = YOLO(MODEL_PATH)
+detector = Detector(MODEL_PATH)
 model_lock = threading.Lock()
 
 state_lock = threading.Lock()
@@ -45,48 +46,35 @@ global_scene_context = "Scanning layout framework..."
 
 
 def run_detection(frame):
-    """Runs YOLO on one BGR frame. Returns (objects, inference_ms).
+    """Detects on one BGR frame and describes each hit the way a walker needs it:
+    which side of the path it's on, and roughly how many steps away.
 
-    Box coordinates come back normalized to 0..1 so the browser can draw them
-    over its own video element at whatever size it happens to be rendering.
+    Returns (objects, inference_ms). Boxes are already normalized to 0..1 by the
+    detector, so the browser can draw them at whatever size it renders the video.
     """
-    img_h, img_w = frame.shape[:2]
-
     with model_lock:
         t0 = time.time()
-        results = model(frame, verbose=False)
+        detections = detector.detect(frame)
         inference_ms = (time.time() - t0) * 1000.0
 
     objects = []
-    for box in results[0].boxes:
-        try:
-            cls = int(box.cls[0])
-            conf = float(box.conf[0])
-            name = model.names[cls]
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        center_x = (x1 + x2) / 2
+        height_ratio = y2 - y1
 
-            bx_w = x2 - x1
-            bx_h = y2 - y1
-            center_x = x1 + (bx_w / 2)
+        # A taller box means a closer object. Crude, but it's monocular vision —
+        # there's no depth to read, only apparent size.
+        position = "left" if center_x < 1 / 3 else "right" if center_x > 2 / 3 else "center"
+        steps = 2 if height_ratio > 0.7 else 4 if height_ratio > 0.4 else 8 if height_ratio > 0.2 else 15
 
-            position = "left" if center_x < img_w / 3 else "right" if center_x > 2 * img_w / 3 else "center"
-            height_ratio = bx_h / img_h
-            steps = 2 if height_ratio > 0.7 else 4 if height_ratio > 0.4 else 8 if height_ratio > 0.2 else 15
-
-            objects.append({
-                "name": name,
-                "confidence": round(conf, 2),
-                "position": position,
-                "steps_away": steps,
-                "box": [
-                    round(x1 / img_w, 4),
-                    round(y1 / img_h, 4),
-                    round(x2 / img_w, 4),
-                    round(y2 / img_h, 4),
-                ],
-            })
-        except Exception:
-            continue
+        objects.append({
+            "name": det["name"],
+            "confidence": det["confidence"],
+            "position": position,
+            "steps_away": steps,
+            "box": det["box"],
+        })
 
     return objects, inference_ms
 

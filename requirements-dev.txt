@@ -1,0 +1,5 @@
+# Only needed to re-export the ONNX model or to run detect.py.
+# The server itself does not need torch — see requirements.txt.
+-r requirements.txt
+ultralytics
+onnx

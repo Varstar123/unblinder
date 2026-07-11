@@ -36,7 +36,7 @@ Interactive docs are at `/docs`.
 
 You need Python 3.10+, Node.js, and a [Groq API key](https://console.groq.com/keys).
 
-**Model weights** are not committed. Download `yolo11n.pt` from the [Ultralytics releases](https://github.com/ultralytics/assets/releases) and put it next to `server.py`. (Ultralytics will also fetch it automatically on first run.)
+The model (`yolo11n.onnx`, 10MB) is committed, so there's nothing to download. Detection runs on **ONNX Runtime, not torch** — torch needs ~400MB resident and won't fit in a small instance, while this runs the same exported model in about 200MB total. If you want to re-export it from `.pt`, or run `detect.py`, install `requirements-dev.txt` instead, which adds ultralytics.
 
 **Backend:**
 
@@ -67,15 +67,11 @@ Note that browsers only grant camera access on `localhost` or over HTTPS.
 
 **Backend** — Render Web Service:
 
-- Build: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt`
+- Build: `pip install -r requirements.txt`
 - Start: `uvicorn server:app --host 0.0.0.0 --port $PORT`
 - Env: `GROQ_API_KEY`
 
-Install torch from the CPU index as shown. A plain `pip install -r requirements.txt`
-pulls the CUDA build of torch — several GB of NVIDIA libraries that a CPU instance
-downloads and then never uses, which makes deploys crawl.
-
-Torch and Ultralytics are heavy even so; the free instance type is not enough.
+The server runs in roughly 200MB, so a 512MB instance is enough.
 
 **Frontend** — Render Static Site:
 
