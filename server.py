@@ -2,6 +2,7 @@ import threading
 import time
 import asyncio
 import base64
+import math
 import os
 import re
 import json
@@ -139,9 +140,52 @@ def _vlm_chat(prompt: str, jpeg: bytes, max_tokens: int = 60,
     return payload["choices"][0]["message"]["content"].strip()
 
 
+# ==========================================
+# MONOCULAR DISTANCE
+# ==========================================
+# One camera has no depth. The only route to a metre is to assume how tall the thing
+# usually is and work backwards from how much of the frame it fills:
+#
+#     distance = real_height x focal_px / box_height_px
+#
+# The previous version bucketed on box height alone — 2/4/8/15 steps — which put a bus
+# and a chair filling 70% of the frame at the same distance, and could not express a
+# threshold like "5 metres" at all. Knowing the class is what makes the number mean
+# something.
+#
+# It is still an estimate. A crouching person reads as far away; a box cropped by the
+# frame edge reads as smaller, so as further off, which is the dangerous direction to be
+# wrong in — hence the `truncated` flag, which the caller is expected to distrust.
+CAMERA_VFOV_DEG = float(os.environ.get("CAMERA_VFOV_DEG", "50"))
+STEP_LENGTH_M = 0.75
+
+# Typical real-world height, in metres, of each COCO class. Approximate by nature — a
+# van and a hatchback are both "car" — but wrong by tens of percent beats wrong by 10x.
+CLASS_HEIGHTS_M = {
+    "person": 1.70, "bicycle": 1.10, "car": 1.50, "motorcycle": 1.20, "airplane": 12.0,
+    "bus": 3.20, "train": 4.00, "truck": 3.00, "boat": 2.00, "traffic light": 0.90,
+    "fire hydrant": 0.75, "stop sign": 0.75, "parking meter": 1.20, "bench": 0.90,
+    "bird": 0.20, "cat": 0.30, "dog": 0.50, "horse": 1.60, "sheep": 0.90, "cow": 1.50,
+    "elephant": 3.00, "bear": 1.20, "zebra": 1.40, "giraffe": 4.50, "backpack": 0.50,
+    "umbrella": 1.00, "handbag": 0.30, "tie": 0.50, "suitcase": 0.70, "frisbee": 0.25,
+    "skis": 1.70, "snowboard": 1.50, "sports ball": 0.22, "kite": 1.00,
+    "baseball bat": 0.80, "baseball glove": 0.30, "skateboard": 0.15, "surfboard": 2.00,
+    "tennis racket": 0.70, "bottle": 0.25, "wine glass": 0.20, "cup": 0.12, "fork": 0.20,
+    "knife": 0.25, "spoon": 0.18, "bowl": 0.10, "banana": 0.20, "apple": 0.08,
+    "sandwich": 0.08, "orange": 0.08, "broccoli": 0.15, "carrot": 0.20, "hot dog": 0.05,
+    "pizza": 0.03, "donut": 0.05, "cake": 0.15, "chair": 0.90, "couch": 0.80,
+    "potted plant": 0.60, "bed": 0.60, "dining table": 0.75, "toilet": 0.75, "tv": 0.60,
+    "laptop": 0.25, "mouse": 0.04, "remote": 0.18, "keyboard": 0.03, "cell phone": 0.15,
+    "microwave": 0.30, "oven": 0.90, "toaster": 0.20, "sink": 0.90, "refrigerator": 1.80,
+    "book": 0.24, "clock": 0.30, "vase": 0.30, "scissors": 0.20, "teddy bear": 0.30,
+    "hair drier": 0.25, "toothbrush": 0.19,
+}
+DEFAULT_HEIGHT_M = 0.50
+
+
 def run_detection(frame):
-    """Detects on one BGR frame and describes each hit the way a walker needs it:
-    which side of the path it's on, and roughly how many steps away.
+    """Detects on one BGR frame and describes each hit the way a walker needs it: how
+    far ahead in metres, and how far off their line of travel.
 
     Returns (objects, inference_ms). Boxes are already normalized to 0..1 by the
     detector, so the browser can draw them at whatever size it renders the video.
@@ -151,22 +195,44 @@ def run_detection(frame):
         detections = detector.detect(frame)
         inference_ms = (time.time() - t0) * 1000.0
 
+    img_h, img_w = frame.shape[:2]
+    aspect = (img_w / img_h) if img_h else (16 / 9)
+    tan_v = math.tan(math.radians(CAMERA_VFOV_DEG) / 2)
+    tan_h = tan_v * aspect
+
     objects = []
     for det in detections:
         x1, y1, x2, y2 = det["box"]
         center_x = (x1 + x2) / 2
-        height_ratio = y2 - y1
+        height_ratio = max(y2 - y1, 1e-6)
 
-        # A taller box means a closer object. Crude, but it's monocular vision —
-        # there's no depth to read, only apparent size.
+        # The frame height cancels out of the pinhole equation, so this works straight
+        # off the normalized box without ever needing the pixel dimensions.
+        real_h = CLASS_HEIGHTS_M.get(det["name"], DEFAULT_HEIGHT_M)
+        distance_m = real_h / (2.0 * tan_v * height_ratio)
+        distance_m = min(max(distance_m, 0.3), 100.0)
+
+        # How far the object sits off the line you are walking. Positive is right,
+        # negative is left. This is what separates "in your way" from "over there" —
+        # a bollard 1m to your left will meet your shoulder; a person 4m to your left
+        # will not, and saying so is the noise we are trying to remove.
+        lateral_m = (center_x - 0.5) * 2.0 * distance_m * tan_h
+
+        # Cropped by the frame edge, so its true height is larger than we can see, so
+        # the real distance is SHORTER than this. Being wrong towards "further away" is
+        # the direction that walks somebody into things, so it is flagged, not hidden.
+        truncated = y1 <= 0.01 or y2 >= 0.99
+
         position = "left" if center_x < 1 / 3 else "right" if center_x > 2 / 3 else "center"
-        steps = 2 if height_ratio > 0.7 else 4 if height_ratio > 0.4 else 8 if height_ratio > 0.2 else 15
 
         objects.append({
             "name": det["name"],
             "confidence": det["confidence"],
             "position": position,
-            "steps_away": steps,
+            "distance_m": round(distance_m, 1),
+            "lateral_m": round(lateral_m, 1),
+            "truncated": truncated,
+            "steps_away": max(1, round(distance_m / STEP_LENGTH_M)),
             "box": det["box"],
         })
 
@@ -244,24 +310,87 @@ def _scene_from_labels(objects) -> Optional[str]:
         return None
 
 
+# ==========================================
+# INDOOR / OUTDOOR
+# ==========================================
+# Everything downstream forks on this. Outdoors, GPS and an OSM footpath are the point.
+# Indoors they are worse than useless — there are no walking routes inside a building and
+# GPS drifts tens of metres, so route guidance would confidently steer someone into a
+# wall. The camera can just look up and see a ceiling, so we ask it.
+VLM_ENV_PROMPT = (
+    "Someone walking is holding this camera. Are they indoors or outdoors?\n"
+    "INDOOR means inside a building: a ceiling above, interior walls, rooms, corridors, "
+    "shops, offices, stations, halls, staircases inside.\n"
+    "OUTDOOR means open air: sky, streets, footpaths, roads, parks, open ground.\n"
+    "Reply with exactly one word: INDOOR or OUTDOOR"
+)
+
+
+@app.post("/api/environment")
+def detect_environment():
+    with state_lock:
+        frame_jpeg = latest_frame_jpeg
+        stale = (time.time() - latest_frame_at) > 5.0
+
+    if frame_jpeg is None or stale:
+        return {"success": False, "indoor": None, "source": "text",
+                "reason": "no live camera frame (is the camera running?)"}
+
+    text, source, reason = _ask_with_vision(
+        lambda _has_image: VLM_ENV_PROMPT, frame_jpeg, "environment", max_tokens=8,
+    )
+    if text is None:
+        return {"success": False, "indoor": None, "source": source, "reason": reason}
+
+    word = text.strip().upper()
+    if word.startswith("INDOOR"):
+        return {"success": True, "indoor": True, "source": source}
+    if word.startswith("OUTDOOR"):
+        return {"success": True, "indoor": False, "source": source}
+
+    # Neither word: better to admit we don't know than to guess and flip the whole
+    # guidance mode on a coin toss.
+    return {"success": False, "indoor": None, "source": source,
+            "reason": f"unclear environment reply: {text[:40]!r}"}
+
+
 # The guidance loop calls this every few seconds while Guide Me is on, so it must be
 # terse and it must SHUT UP when there is nothing wrong. A hazard scanner that says
 # "the path is clear" every seven seconds is just a loop of noise the user has to
 # talk over — so the model is given an explicit way to say nothing: the word CLEAR.
-VLM_HAZARD_PROMPT = (
+#
+# What counts as a hazard is not the same in a corridor as on a street, so the list is
+# not the same either. Asking about potholes indoors just invites false positives.
+_HAZARD_HEAD = (
     "You are watching the ground ahead for a blind person who is walking right now.\n"
-    "Look ONLY for things that could hurt them within their next few steps: a pit or open "
-    "hole, a missing drain cover, broken or uneven pavement, a step or kerb up or down, a "
-    "staircase, a puddle or wet floor, a barrier or roadworks, a vehicle blocking the way, "
-    "or the footpath ending, narrowing, or being blocked.\n"
-    "If you see none of those and the way ahead is walkable, reply with exactly one word: CLEAR\n"
+    "Look ONLY for things that could hurt them within their next few steps:\n"
+)
+_HAZARD_TAIL = (
+    "\nIf you see none of those and the way ahead is walkable, reply with exactly one "
+    "word: CLEAR\n"
     "Otherwise reply with ONE spoken warning, under 12 words, second person, naming the "
     "hazard and which side it is on. No markdown, no preamble, no reassurance."
 )
 
+VLM_HAZARD_PROMPT_OUTDOOR = _HAZARD_HEAD + (
+    "a pit or open hole, a missing drain cover, broken or uneven pavement, a step or kerb "
+    "up or down, a puddle, a barrier or roadworks, a vehicle blocking the way, a bollard "
+    "or post, or the footpath ending, narrowing, or being blocked."
+) + _HAZARD_TAIL
+
+VLM_HAZARD_PROMPT_INDOOR = _HAZARD_HEAD + (
+    "a staircase or single step up or down, a wet or slippery floor, a glass door or glass "
+    "wall, a door in the way, furniture or boxes in the path, a trailing cable, an open "
+    "drawer or cupboard, a low beam or overhead obstruction, or the corridor being blocked."
+) + _HAZARD_TAIL
+
+
+class HazardRequest(BaseModel):
+    indoor: bool = False
+
 
 @app.post("/api/hazards")
-def scan_hazards():
+def scan_hazards(payload: HazardRequest = HazardRequest()):
     """Underfoot hazard check for the active guidance loop. Returns hazard=False far more
     often than True, and the caller is expected to stay silent when it does."""
     with state_lock:
@@ -272,8 +401,9 @@ def scan_hazards():
         return {"success": False, "hazard": False, "source": "text",
                 "reason": "no live camera frame (is the camera running?)"}
 
+    prompt = VLM_HAZARD_PROMPT_INDOOR if payload.indoor else VLM_HAZARD_PROMPT_OUTDOOR
     text, source, reason = _ask_with_vision(
-        lambda _has_image: VLM_HAZARD_PROMPT, frame_jpeg, "hazards", max_tokens=40,
+        lambda _has_image: prompt, frame_jpeg, "hazards", max_tokens=40,
     )
     if text is None:
         return {"success": False, "hazard": False, "source": source, "reason": reason}

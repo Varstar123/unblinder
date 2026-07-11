@@ -352,11 +352,59 @@ function normalizeAngleDiff(bearing, heading) {
 // and then latches. Standing in front of the same obstacle stays silent. The latch
 // only clears when the object actually leaves the frame, which is what makes a
 // second warning mean something new — it came back.
-const DANGER_STEPS = 3
+// A thing is only worth mentioning if you are going to walk into it. "Person, twenty
+// metres away" is not information, it is noise — and noise in an audio-only interface
+// is worse than nothing, because the user has to talk over it to be heard.
+//
+// So the test is a corridor, not a radius: the strip of ground you are about to occupy.
+//
+//              <---------- 5 m ---------->
+//          .--------------------------------.
+//          |  |                          |  |    in the corridor : warn under 5 m
+//     side |  |        CORRIDOR          |  | side   off to the side : warn under 2 m,
+//          |  |                          |  |        and only if close enough to clip
+//          '--------------------------------'
+//                       [ you ]
+const AHEAD_WARN_M = 5.0        // in your path: this far ahead matters
+const SIDE_WARN_M = 2.0         // off to the side: only when you could still clip it
+const CORRIDOR_HALF_W_M = 0.75  // half the width of a walking person, plus a margin
+const SIDE_REACH_M = 1.5        // beyond this, off to the side, it cannot be hit at all
+
 // YOLO drops a box for a frame or two constantly; without this grace period that
 // flicker would read as "left and came back" and re-fire the warning, which is
 // exactly the loop we are removing. It must outlast a dropped frame, not a real exit.
 const REARM_AFTER_ABSENT_MS = 2000
+
+// Is this thing actually in the way?
+function isObstructing(o) {
+  if (o.distance_m == null) return false
+  const lateral = Math.abs(o.lateral_m || 0)
+
+  // Anything closer than about two metres overflows the frame, so its box is cropped and
+  // its height — the only thing we measure distance from — is a lie that reads FAR. That
+  // is the one direction we cannot afford to be wrong in, so a cropped box in the
+  // corridor is treated as close. A false warning is an annoyance; a missed one is a fall.
+  const closeEnough = (limit) => o.truncated || o.distance_m <= limit
+
+  if (lateral <= CORRIDOR_HALF_W_M) return closeEnough(AHEAD_WARN_M)
+  if (lateral > SIDE_REACH_M) return false
+  return closeEnough(SIDE_WARN_M)
+}
+
+function describeObstruction(o) {
+  const lateral = o.lateral_m || 0
+  const where = Math.abs(lateral) <= CORRIDOR_HALF_W_M
+    ? 'ahead'
+    : lateral > 0 ? 'on your right' : 'on your left'
+
+  // A cropped box is exactly the case where the distance is not to be believed — it
+  // reads far because we can only see part of the object. Warning on it is right;
+  // reading out the number we just decided was wrong is not. Say "close" and mean it.
+  if (o.truncated) return `${o.name}, close, ${where}.`
+
+  const metres = Math.max(1, Math.round(o.distance_m))
+  return `${o.name}, ${metres} ${metres === 1 ? 'metre' : 'metres'} ${where}.`
+}
 
 // ==========================================
 // CONTINUOUS GUIDANCE
@@ -371,7 +419,7 @@ const REARM_AFTER_ABSENT_MS = 2000
 // an aid people talk over is an aid people switch off.
 const HAZARD_SCAN_MS = 7000        // how often the camera is checked for pits, kerbs, steps
 const HAZARD_REPEAT_MS = 15000     // the same hazard is not re-announced inside this window
-const BRIEFING_MS = 25000          // routine "turn left in 30 metres" cadence
+const ENV_CHECK_MS = 30000         // re-check indoor/outdoor: people walk out of buildings
 
 const OFF_ROUTE_M = 25             // drifted this far from the route line: say so
 const BACK_ON_ROUTE_M = 12         // and only call them back on once clearly back
@@ -385,16 +433,22 @@ const HEADING_SUSTAIN_MS = 6000    // ...but only after holding it this long. A 
                                    // on a single reading would fire almost continuously.
 const ARRIVAL_M = 12               // close enough to a checkpoint to call it reached
 
+// Objects is an explicit question, so unlike the guidance warnings it answers about the
+// whole view rather than only the corridor — but nearest first, and in metres.
 function buildObjectsNarration(objs) {
-  if (!objs || objs.length === 0) return "No objects currently detected in view."
-  const sorted = [...objs].sort((a, b) => (a.steps_away ?? 99) - (b.steps_away ?? 99))
+  if (!objs || objs.length === 0) return "Nothing is detected in view."
+  const sorted = [...objs].sort((a, b) => (a.distance_m ?? 99) - (b.distance_m ?? 99))
   const top = sorted.slice(0, 6)
   const parts = top.map((o) => {
-    const where = o.position === 'center' ? 'ahead' : `to your ${o.position}`
-    return `${o.name}, ${o.steps_away} steps ${where}`
+    const lateral = o.lateral_m || 0
+    const where = Math.abs(lateral) <= CORRIDOR_HALF_W_M
+      ? 'ahead'
+      : lateral > 0 ? 'to your right' : 'to your left'
+    const metres = Math.max(1, Math.round(o.distance_m ?? 0))
+    return `${o.name}, ${metres} ${metres === 1 ? 'metre' : 'metres'} ${where}`
   })
   const remaining = objs.length - top.length
-  const countNote = remaining > 0 ? ` and ${remaining} more object${remaining > 1 ? 's' : ''} further out` : ''
+  const countNote = remaining > 0 ? ` and ${remaining} more further out` : ''
   return `${top.length} object${top.length > 1 ? 's' : ''} detected. ${parts.join('. ')}${countNote}.`
 }
 
@@ -434,6 +488,11 @@ export default function App() {
   const headingLatchRef = useRef({ since: 0, warned: false })
   const hazardLatchRef = useRef({ text: '', at: 0 })
   const hazardInFlightRef = useRef(false)
+
+  // null until the camera has actually been looked at. Not the same as false — guessing
+  // "outdoor" before we know would switch on GPS route guidance inside a building.
+  const [indoor, setIndoor] = useState(null)
+  const indoorRef = useRef(null)
   
   // VOICE RECOGNITION (AI ASSISTANT) STATE
   const [theme, setTheme] = useState(() => {
@@ -612,6 +671,10 @@ export default function App() {
   // or not guidance is on, so the map stays truthful — but it only speaks while guiding,
   // because an app that calls out turns you never asked for is an app talking to itself.
   function evaluateProactivePathStep(userCoords) {
+    // Indoors the GPS fix drifts tens of metres and there is no footpath to be on, so
+    // "you have reached your checkpoint" would be a coin toss announced as a fact.
+    if (indoorRef.current === true) return
+
     const route = navRouteDataRef.current
     if (!route || !route.checkpoints || route.checkpoints.length === 0) return
 
@@ -643,6 +706,7 @@ export default function App() {
   // altogether, and walking the right path in the wrong direction.
   function evaluateDeviation(userCoords) {
     if (!guidingRef.current) return
+    if (indoorRef.current === true) return  // no path to be off, and no usable fix
     const route = navRouteDataRef.current
     if (!route || !route.checkpoints || route.checkpoints.length === 0) return
 
@@ -742,6 +806,40 @@ export default function App() {
     }
   }
 
+  // Indoors or out? Everything forks on this, so it is asked of the camera rather than
+  // guessed from GPS — a building has a ceiling, and the model can simply see it.
+  async function checkEnvironment() {
+    if (!guidingRef.current || !runningRef.current) return
+    try {
+      const res = await fetch(`${BACKEND}/api/environment`, { method: 'POST' })
+      const data = await res.json()
+      if (!guidingRef.current) return
+
+      if (!data.success || data.indoor == null) {
+        if (data.reason) logToConsole(`[ENV]: unknown — ${data.reason}`)
+        return
+      }
+      if (indoorRef.current === data.indoor) return
+
+      const firstAnswer = indoorRef.current === null
+      indoorRef.current = data.indoor
+      setIndoor(data.indoor)
+      logToConsole(`[ENV]: ${data.indoor ? 'INDOOR' : 'OUTDOOR'}`)
+
+      if (data.indoor) {
+        // Say this plainly rather than quietly degrade. A blind user who believes they
+        // are being routed, and is not, is in more danger than one who knows they aren't.
+        audioQueue.speakExplicit(
+          ['You are indoors. I cannot guide you to a destination here, but I will warn you about what is ahead.'],
+          1.1, voiceEnabledRef)
+      } else if (!firstAnswer) {
+        audioQueue.speakExplicit(['You are outdoors. Route guidance is back on.'], 1.1, voiceEnabledRef)
+      }
+    } catch (err) {
+      // Next tick retries; an unknown environment simply leaves the mode unchanged.
+    }
+  }
+
   // Checks what is underfoot. Only speaks when there is actually something wrong —
   // the backend answers CLEAR most of the time and we stay quiet on that.
   async function scanHazards() {
@@ -750,7 +848,13 @@ export default function App() {
 
     hazardInFlightRef.current = true
     try {
-      const res = await fetch(`${BACKEND}/api/hazards`, { method: 'POST' })
+      const res = await fetch(`${BACKEND}/api/hazards`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // What counts as a hazard differs: stairs and glass doors inside, potholes and
+        // kerbs outside. Asking about potholes in a corridor only invites false positives.
+        body: JSON.stringify({ indoor: indoorRef.current === true }),
+      })
       const data = await res.json()
       if (!guidingRef.current) return
 
@@ -782,6 +886,8 @@ export default function App() {
     offRouteLatchRef.current = false
     headingLatchRef.current = { since: 0, warned: false }
     hazardLatchRef.current = { text: '', at: 0 }
+    indoorRef.current = null
+    setIndoor(null)
     logToConsole('[GUIDE]: guidance stopped.')
     audioQueue.clearAll()
     if (message) audioQueue.speakExplicit([message], 1.1, voiceEnabledRef)
@@ -789,19 +895,23 @@ export default function App() {
 
   // Guide Me is a mode, not a sentence. Press once to start, again to stop, again to
   // start — and it stays on by itself until the destination is reached.
+  //
+  // A route is no longer required. Indoors there cannot be one, and refusing to help at
+  // all because OpenStreetMap has no footpath through a shopping centre would be absurd:
+  // without a destination it is still a working set of eyes.
   function handleGuideMeButton() {
     if (guidingRef.current) {
       stopGuiding('Guidance stopped.')
       return
     }
 
-    if (!currentPositionRef.current) {
-      audioQueue.speakExplicit(['GPS is not acquired yet.'], 1.1, voiceEnabledRef)
-      return
-    }
     const route = navRouteDataRef.current
-    if (!route || !route.checkpoints || route.checkpoints.length === 0) {
-      audioQueue.speakExplicit(['No destination is set. Set a destination first.'], 1.1, voiceEnabledRef)
+    const hasRoute = !!(route && route.checkpoints && route.checkpoints.length)
+
+    if (!runningRef.current && !hasRoute) {
+      audioQueue.speakExplicit(
+        ['I need either the camera or a destination. Start the camera, or set where you want to go.'],
+        1.1, voiceEnabledRef)
       return
     }
 
@@ -810,33 +920,54 @@ export default function App() {
     offRouteLatchRef.current = false
     headingLatchRef.current = { since: 0, warned: false }
     hazardLatchRef.current = { text: '', at: 0 }
-    logToConsole('[GUIDE]: continuous guidance started.')
+    indoorRef.current = null
+    setIndoor(null)
+    logToConsole('[GUIDE]: guidance started.')
 
-    // Hazard scanning is the one part that needs the camera. Navigation still works
-    // without it, so say what is missing rather than refusing to guide at all.
     if (!runningRef.current) {
-      logToConsole('[GUIDE]: camera is off — no hazard scanning.')
       audioQueue.speakExplicit(
-        ['Guiding you now. The camera is off, so I cannot warn you about the ground ahead. Start the camera for that.'],
-        1.1, voiceEnabledRef)
+        ['Guiding you. The camera is off, so I cannot see the path ahead.'], 1.1, voiceEnabledRef)
+      return
     }
-    speakBriefing({ explicit: runningRef.current })
+    if (!hasRoute) {
+      audioQueue.speakExplicit(
+        ['Watching the path ahead. No destination is set, so I will warn you but not guide you anywhere.'],
+        1.1, voiceEnabledRef)
+      return
+    }
+    if (!currentPositionRef.current) {
+      audioQueue.speakExplicit(['Guiding you. Waiting for GPS.'], 1.1, voiceEnabledRef)
+      return
+    }
+
+    // One briefing on the press — the user asked, and is waiting to hear something. After
+    // this it goes quiet, and only speaks when something is wrong.
+    speakBriefing({ explicit: true })
   }
 
   // The guidance loop. Only alive while guiding, so nothing here runs — and no VLM call
   // is ever made — unless the user has actually asked to be guided.
+  //
+  // Note what is NOT here any more: the periodic re-briefing. Walking the route correctly
+  // is now silent. Being told "turn left in 30 metres" every 25 seconds when you are
+  // already walking correctly toward that turn tells you nothing you did not know, and an
+  // aid people talk over is an aid people switch off. It speaks at the turn itself, when
+  // something is in the way, when the ground is dangerous, and when you go wrong.
   useEffect(() => {
     if (!guiding) return
+    checkEnvironment()
+    scanHazards()
     const hazardTimer = setInterval(scanHazards, HAZARD_SCAN_MS)
-    const briefTimer = setInterval(() => speakBriefing({ explicit: false }), BRIEFING_MS)
+    const envTimer = setInterval(checkEnvironment, ENV_CHECK_MS)
     return () => {
       clearInterval(hazardTimer)
-      clearInterval(briefTimer)
+      clearInterval(envTimer)
     }
   }, [guiding])
 
-  // Fires once when something comes within DANGER_STEPS, then stays quiet for as long
-  // as it is on screen. See the constants above for why it latches rather than repeats.
+  // Fires once when something enters the corridor, then stays quiet for as long as it is
+  // on screen. See isObstructing() above for what counts, and the latch comments for why
+  // it fires on the edge rather than repeating.
   function announceDangers(liveObjects) {
     const now = Date.now()
     const latch = dangerLatchRef.current
@@ -846,10 +977,9 @@ export default function App() {
       entry.lastSeenAt = now
       latch[obj.name] = entry
 
-      if (obj.steps_away > DANGER_STEPS || entry.warned) return
+      if (entry.warned || !isObstructing(obj)) return
       entry.warned = true
-      const where = obj.position === 'center' ? 'ahead' : `on your ${obj.position}`
-      audioQueue.speakAmbient(`${obj.name}, ${obj.steps_away} steps ${where}.`, 1.15, voiceEnabledRef)
+      audioQueue.speakAmbient(describeObstruction(obj), 1.15, voiceEnabledRef)
     })
 
     // Re-arm only once it has genuinely gone, not merely blinked out for a frame.
@@ -1164,11 +1294,13 @@ export default function App() {
       const w = (nx2 - nx1) * dw
       const h = (ny2 - ny1) * dh
 
-      const color = obj.steps_away <= 3 ? '#f87171' : '#4ade80'
+      // Red means the same thing the voice means: this one is in your way. Anything else
+      // is just something the detector happened to see.
+      const color = isObstructing(obj) ? '#f87171' : '#4ade80'
       ctx.strokeStyle = color
       ctx.strokeRect(x, y, w, h)
 
-      const label = `${obj.name} · ${obj.steps_away} steps`
+      const label = `${obj.name} · ${obj.distance_m ?? '?'}m`
       const labelY = Math.max(y - 18, 0)
       ctx.fillStyle = color
       ctx.fillRect(x, labelY, ctx.measureText(label).width + 10, 18)
@@ -1349,11 +1481,15 @@ export default function App() {
       id: 'guide',
       spine: guiding ? 'Guiding' : 'Guide',
       glyph: <IconCompass />,
-      title: guiding ? 'Guiding…' : 'Guide Me',
-      description: guiding
-        ? 'Guiding you to your destination. Watching for obstacles, hazards underfoot, and drifting off the path. Tap again to stop.'
-        : 'Guides you continuously to your destination — turns, obstacles, hazards, and warnings if you wander off the path. Tap again to stop.',
-      idle: guiding ? 'Active · Tap to stop' : 'Turn · Hazards · Path',
+      title: guiding ? (indoor === true ? 'Watching…' : 'Guiding…') : 'Guide Me',
+      description: !guiding
+        ? 'Guides you to your destination and then stays quiet — speaking only at a turn, when something is in your way, or when you go wrong. Tap again to stop.'
+        : indoor === true
+          ? 'Indoors: no route to follow, so it watches instead. Warning about obstacles, steps, glass and anything in your path.'
+          : 'Silent while you are on track. Speaks at turns, when something is in your way, and if you drift off the path.',
+      idle: guiding
+        ? (indoor === null ? 'Active · checking…' : indoor ? 'Indoors · watching' : 'Outdoors · on route')
+        : 'Silent unless it matters',
       ariaLabel: guiding ? 'Stop guidance' : 'Guide me: start continuous spoken navigation',
       onClick: handleGuideMeButton,
       // Never disabled: the button has to remain pressable in order to stop guidance.
@@ -1645,7 +1781,9 @@ return (
                   <div style={{ background: 'var(--btn-bg)', color: 'var(--btn-ink)', fontWeight: '800', padding: '10px', borderRadius: '10px', fontFamily: 'monospace' }}>{(o.position || 'ce').slice(0,2).toUpperCase()}</div>
                   <div>
                     <div style={{ fontWeight: '700', fontSize: '1.2rem' }}>{o.name}</div>
-                    <div style={{ color: 'var(--warn)', fontWeight: '800', fontSize: '0.85rem', marginTop: '4px' }}>{o.steps_away} STEPS AWAY</div>
+                    <div style={{ color: isObstructing(o) ? 'var(--danger, #ef4444)' : 'var(--warn)', fontWeight: '800', fontSize: '0.85rem', marginTop: '4px' }}>
+                      {o.distance_m}m {isObstructing(o) ? '· IN YOUR WAY' : 'away'}
+                    </div>
                   </div>
                 </div>
               ))}
