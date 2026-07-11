@@ -298,6 +298,91 @@ main{ display:grid; grid-template-columns: 1fr 360px; gap:20px; padding:18px; he
 }
 
 /* ==========================================================
+   PAGE LAYOUT
+   These live here rather than as inline styles for one reason: an inline
+   style cannot be inside a media query, so a grid declared in JSX is a grid
+   that can never collapse on a phone. Every rule below has a mobile answer.
+   ========================================================== */
+.unblinder-app{ min-height:100vh; padding:2rem }
+
+/* Nothing may push the page wider than the screen. On a phone a single
+   overflowing child means the whole document scrolls sideways, and every
+   section below inherits the damage. */
+html, body{ max-width:100%; overflow-x:hidden }
+*, *::before, *::after{ box-sizing:border-box }
+img, canvas, video{ max-width:100% }
+
+.ub-header{
+	display:flex; justify-content:space-between; align-items:center;
+	gap:1rem; margin-bottom:2rem; padding-bottom:1.5rem;
+	border-bottom:1px solid var(--border);
+}
+.ub-brand-row{ display:flex; align-items:center; gap:10px }
+.ub-brand h1{
+	font-size:2rem; font-weight:800; letter-spacing:-.05em;
+	background:linear-gradient(to right, var(--title-a), var(--title-b));
+	-webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+}
+.ub-brand p{ color:var(--text-muted); font-size:.95rem; margin-top:4px }
+.ub-live-dot{
+	height:10px; width:10px; border-radius:50%; flex:0 0 auto;
+	background:var(--accent-2); box-shadow:0 0 12px var(--accent-2);
+}
+
+.ub-hud{
+	display:flex; align-items:center; gap:16px;
+	background:var(--surface); padding:.75rem 1.5rem;
+	border-radius:14px; border:1px solid var(--border-2);
+}
+
+.ub-navform{ display:grid; grid-template-columns:1fr 1fr 180px; gap:1rem; align-items:end }
+.ub-mapgrid{ display:grid; grid-template-columns:1fr 300px; gap:1.5rem }
+.ub-mapbox{ height:350px }
+.ub-main{ display:grid; grid-template-columns:1fr 420px; gap:2rem; align-items:start }
+.ub-scene{ padding:2rem }
+/* The scene summary is the one line a sighted helper reads over the user's
+   shoulder, so it stays large — but 1.75rem on a 360px screen is four words a
+   line, so it scales with the viewport instead of being fixed. */
+.ub-scene-text{ font-size:clamp(1.05rem, 4.5vw, 1.75rem); line-height:1.35 }
+
+/* ---------- tablet / small laptop ---------- */
+@media (max-width: 1100px){
+	.ub-main{ grid-template-columns:1fr }
+}
+
+/* ---------- phone ---------- */
+@media (max-width: 900px){
+	.unblinder-app{ padding:1rem }
+
+	/* The header is a title next to a dense strip of controls. Side by side that
+	   strip is what blows out the width, so stack it and let the controls wrap. */
+	.ub-header{ flex-direction:column; align-items:stretch; gap:1rem; margin-bottom:1.5rem }
+	.ub-hud{ flex-wrap:wrap; justify-content:center; gap:12px; padding:.75rem }
+	.ub-brand h1{ font-size:1.5rem }
+	.ub-brand p{ font-size:.85rem }
+
+	.ub-navform{ grid-template-columns:1fr }
+	.ub-mapgrid{ grid-template-columns:1fr }
+	.ub-mapbox{ height:260px }
+	.ub-scene{ padding:1.25rem }
+
+	/* A phone is held in a hand, often one-handed, sometimes by someone who cannot
+	   see the target. 44px is the smallest reliably tappable box. */
+	.ub-link-btn, .ub-navform button{ min-height:44px }
+}
+
+/* ---------- narrow phone ---------- */
+@media (max-width: 520px){
+	.unblinder-app{ padding:.75rem }
+	.ub-brand h1{ font-size:1.15rem; letter-spacing:-.02em }
+	.ub-brand p{ font-size:.75rem }
+	.ub-hud{ gap:10px }
+	/* Latency/FPS is a developer readout. It is the first thing to go when the
+	   header runs out of room. */
+	.ub-stat{ display:none }
+}
+
+/* ==========================================================
    HUD LINK BUTTON
    Flat text; an accent bar wipes in from the left on hover and
    retracts to the right on leave. Colour is per-button via

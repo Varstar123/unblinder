@@ -377,7 +377,9 @@ export default function App() {
   }, [theme])
 
   const [isListening, setIsListening] = useState(false)
+  const [speechSupported, setSpeechSupported] = useState(true)
   const recognitionRef = useRef(null)
+  const micGrantedRef = useRef(false)
   const aiPhaseRef = useRef('idle') // Tracks 'idle' | 'listening' | 'processing'
 
   const wsRef = useRef(null)
@@ -440,24 +442,40 @@ export default function App() {
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (SpeechRecognition) {
+      setSpeechSupported(true)
       recognitionRef.current = new SpeechRecognition()
       recognitionRef.current.continuous = false
       recognitionRef.current.lang = 'en-US'
-      
+
       recognitionRef.current.onresult = (event) => {
         aiPhaseRef.current = 'processing'
         const text = event.results[0][0].transcript
         setIsListening(false)
         handleAiQuery(text)
       }
-      
+
       recognitionRef.current.onerror = (e) => {
         logToConsole(`[MIC ERROR]: ${e.error}`)
         setIsListening(false)
         aiPhaseRef.current = 'idle'
         audioQueue.isAmbientSuppressed = false
+
+        // The user cannot see the debug log — especially on a phone, and especially
+        // if they are blind. Every failure has to be audible or it did not happen.
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          micGrantedRef.current = false
+          audioQueue.speakExplicit(
+            ['Microphone access is blocked. Allow the microphone for this site in your browser settings, then try again.'],
+            1.1, voiceEnabledRef)
+        } else if (e.error === 'no-speech') {
+          audioQueue.speakExplicit(["I didn't hear anything. Tap the assistant and speak again."], 1.1, voiceEnabledRef)
+        } else if (e.error === 'network') {
+          audioQueue.speakExplicit(['Speech recognition needs a network connection and could not reach it.'], 1.1, voiceEnabledRef)
+        } else if (e.error !== 'aborted') {
+          audioQueue.speakExplicit(['The microphone failed. Please try again.'], 1.1, voiceEnabledRef)
+        }
       }
-      
+
       recognitionRef.current.onend = () => {
         setIsListening(false)
         // If it was just listening but no text was spoken, release the lock instantly
@@ -467,6 +485,7 @@ export default function App() {
         }
       }
     } else {
+      setSpeechSupported(false)
       logToConsole("SpeechRecognition API not supported in this browser.")
     }
   }, [])
@@ -661,26 +680,77 @@ export default function App() {
     })()
   }
 
-  function toggleListen() {
+  // Raises the browser's microphone prompt, the same one the camera and GPS raise.
+  //
+  // SpeechRecognition.start() is supposed to ask for the mic itself, and on desktop
+  // Chrome it does. On mobile it frequently does not: no dialog ever appears, start()
+  // just fails with not-allowed, and the button looks broken. getUserMedia is what
+  // reliably triggers the prompt — so we ask through that first, then hand over.
+  //
+  // We drop the stream immediately. We never wanted audio, only the permission, and
+  // holding the track open can stop SpeechRecognition acquiring the mic afterwards.
+  async function ensureMicPermission() {
+    if (micGrantedRef.current) return true
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      logToConsole('[MIC ERROR]: no microphone API in this browser.')
+      audioQueue.speakExplicit(['This browser has no microphone access.'], 1.1, voiceEnabledRef)
+      return false
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream.getTracks().forEach((track) => track.stop())
+      micGrantedRef.current = true
+      logToConsole('[MIC]: permission granted.')
+      return true
+    } catch (err) {
+      logToConsole(`[MIC ERROR]: ${err.name} — ${err.message}`)
+      audioQueue.speakExplicit(
+        ['Microphone access was denied. Allow the microphone for this site, then tap the assistant again.'],
+        1.1, voiceEnabledRef)
+      return false
+    }
+  }
+
+  async function toggleListen() {
     if (!recognitionRef.current) {
-      logToConsole("Speech recognition not supported in this browser.")
+      logToConsole('Speech recognition not supported in this browser.')
+      audioQueue.speakExplicit(
+        ['Voice input is not supported in this browser. Try Chrome.'],
+        1.1, voiceEnabledRef)
       return
     }
+
     if (isListening) {
       recognitionRef.current.stop()
       setIsListening(false)
       aiPhaseRef.current = 'idle'
       audioQueue.isAmbientSuppressed = false
-    } else {
-      actionIdRef.current += 1
-      audioQueue.clearAll()
-      
-      // Lock background noise completely before opening mic channel
-      aiPhaseRef.current = 'listening'
-      audioQueue.isAmbientSuppressed = true 
-      
+      return
+    }
+
+    // Only the very first tap awaits: once granted, micGrantedRef short-circuits and
+    // start() runs synchronously inside the click, which keeps the user gesture that
+    // stricter mobile browsers require.
+    if (!(await ensureMicPermission())) return
+
+    actionIdRef.current += 1
+    audioQueue.clearAll()
+
+    // Lock background noise completely before opening mic channel
+    aiPhaseRef.current = 'listening'
+    audioQueue.isAmbientSuppressed = true
+
+    try {
       recognitionRef.current.start()
       setIsListening(true)
+    } catch (err) {
+      // start() throws if the previous session hasn't fully torn down yet.
+      logToConsole(`[MIC ERROR]: ${err.message}`)
+      aiPhaseRef.current = 'idle'
+      audioQueue.isAmbientSuppressed = false
+      setIsListening(false)
     }
   }
 
@@ -1046,10 +1116,12 @@ export default function App() {
       spine: isListening ? 'Listening' : 'Assistant',
       glyph: isListening ? <IconMic /> : <IconSparkle />,
       title: isListening ? 'Listening…' : 'AI Assistant',
-      description: isListening
-        ? 'Microphone is open and ambient narration is suppressed. Ask your question now.'
-        : 'Ask anything about the scene around you. Tap once to open the microphone, tap again to cancel.',
-      idle: isListening ? 'Speak now' : 'Ask anything',
+      description: !speechSupported
+        ? 'Voice input needs the Web Speech API, which this browser does not have. Chrome supports it, on desktop and on Android.'
+        : isListening
+          ? 'Microphone is open and ambient narration is suppressed. Ask your question now.'
+          : 'Ask anything about the scene around you. Tap once to open the microphone, tap again to cancel.',
+      idle: !speechSupported ? 'Unsupported browser' : isListening ? 'Speak now' : 'Ask anything',
       ariaLabel: isListening ? 'Stop listening' : 'AI Assistant: ask questions about the scene',
       onClick: toggleListen,
       disabled: false,
@@ -1061,18 +1133,18 @@ export default function App() {
   ]
 
 return (
-    <div className="unblinder-app" style={{ minHeight: '100vh', background: 'var(--surface-2)', color: 'var(--text)', fontFamily: 'sans-serif', padding: '2rem' }}>
+    <div className="unblinder-app" style={{ background: 'var(--surface-2)', color: 'var(--text)', fontFamily: 'sans-serif' }}>
 
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem', paddingBottom: '1.5rem', borderBottom: '1px solid var(--border)' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <span style={{ height: '10px', width: '10px', borderRadius: '50%', background: 'var(--accent-2)', boxShadow: '0 0 12px var(--accent-2)' }} />
-            <h1 style={{ fontSize: '2rem', fontWeight: '800', letterSpacing: '-0.05em', background: 'linear-gradient(to right, var(--title-a), var(--title-b))', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>UNBLINDER COGNITIVE CONSOLE</h1>
+      <header className="ub-header">
+        <div className="ub-brand">
+          <div className="ub-brand-row">
+            <span className="ub-live-dot" aria-hidden="true" />
+            <h1>UNBLINDER COGNITIVE CONSOLE</h1>
           </div>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', marginTop: '4px' }}>Tactical Core Architecture • Accelerated Spatial Telemetry Frame</p>
+          <p>Tactical Core Architecture • Accelerated Spatial Telemetry Frame</p>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', background: 'var(--surface)', padding: '0.75rem 1.5rem', borderRadius: '14px', border: '1px solid var(--border-2)' }}>
+        <div className="ub-hud">
           <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
 
           <label className={`ub-speech${voiceEnabled ? ' is-on' : ''}`}>
@@ -1118,7 +1190,7 @@ return (
               <span className={running ? 'is-hidden' : undefined}>Start Camera</span>
             </span>
           </button>
-          <div style={{ fontSize: '0.85rem', fontFamily: 'monospace', color: 'var(--text-muted)' }}>LATENCY: {fps > 0 ? `${Math.round(1000/fps)}ms` : '—'} • FPS: {fps}</div>
+          <div className="ub-stat" style={{ fontSize: '0.85rem', fontFamily: 'monospace', color: 'var(--text-muted)' }}>LATENCY: {fps > 0 ? `${Math.round(1000/fps)}ms` : '—'} • FPS: {fps}</div>
         </div>
       </header>
 
@@ -1168,7 +1240,7 @@ return (
           <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', fontFamily: 'monospace' }}>REALTIME LOCATION MONITORING INTERFACE</p>
         </div>
 
-        <form onSubmit={executeRoutingProcess} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 180px', gap: '1rem', alignItems: 'end' }}>
+        <form onSubmit={executeRoutingProcess} className="ub-navform">
           <div>
             <label style={{ display: 'block', color: 'var(--text-muted)', fontSize: '0.8rem', fontWeight: '700', marginBottom: '6px', fontFamily: 'monospace' }}>START POINT REFERENCE</label>
             <input type="text" value={startInput} disabled style={{ width: '100%', padding: '0.75rem 1rem', background: 'var(--surface-2)', border: '1px solid var(--border-2)', borderRadius: '10px', color: 'var(--text-muted)' }} />
@@ -1184,9 +1256,9 @@ return (
       {/* INTERACTIVE LEAFLET MAP SECTION */}
       <section style={{ background: 'var(--surface-3)', border: '1px solid var(--border)', borderRadius: '18px', padding: '1.5rem', marginBottom: '2rem' }}>
         <h3 style={{ fontSize: '1rem', fontFamily: 'monospace', color: 'var(--heading-accent)', marginBottom: '1rem', fontWeight: '800' }}>🗺️ HIGH-PRECISION VISUAL POSITIONING VERIFICATION MONITOR</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: '1.5rem' }}>
-          
-          <div style={{ height: '350px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '14px', position: 'relative', overflow: 'hidden' }}>
+        <div className="ub-mapgrid">
+
+          <div className="ub-mapbox" style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '14px', position: 'relative', overflow: 'hidden' }}>
             {currentPosition ? (
               <MapContainer 
                 center={[currentPosition.lat, currentPosition.lon]} 
@@ -1244,7 +1316,7 @@ return (
         </div>
       </section>
 
-      <main style={{ display: 'grid', gridTemplateColumns: '1fr 420px', gap: '2rem', alignItems: 'start' }}>
+      <main className="ub-main">
         <section style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           <div style={{ position: 'relative', width: '100%', aspectRatio: '16/9', background: 'var(--video-bed)', borderRadius: '18px', overflow: 'hidden', border: '2px solid var(--border)' }}>
             {running ? (
@@ -1270,9 +1342,9 @@ return (
             )}
           </div>
 
-          <div style={{ padding: '2rem', background: 'linear-gradient(135deg, var(--surface-3), var(--surface))', borderRadius: '18px', border: '1px solid var(--border)' }}>
+          <div className="ub-scene" style={{ background: 'linear-gradient(135deg, var(--surface-3), var(--surface))', borderRadius: '18px', border: '1px solid var(--border)' }}>
             <div style={{ fontSize: '0.8rem', fontFamily: 'monospace', color: 'var(--success)', fontWeight: '700', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Macro Scene Summary Context</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: '700', color: 'var(--text)' }}>"{aiDescription}"</div>
+            <div className="ub-scene-text" style={{ fontWeight: '700', color: 'var(--text)' }}>"{aiDescription}"</div>
           </div>
 
           <div style={{ padding: '1.5rem', background: 'var(--surface)', border: '2px solid var(--border)', borderRadius: '18px' }}>
