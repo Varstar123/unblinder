@@ -961,7 +961,7 @@ export default function App() {
       ariaLabel: 'Guide me: get spoken navigation directions',
       onClick: handleGuideMeButton,
       disabled: activeAction === 'guide',
-      tint: { '--ub-glow': 'rgba(2,132,199,0.55)', '--ub-soft': 'rgba(2,132,199,0.17)', '--ub-base': '#0b3a5d', '--ub-status': '#bae6fd' },
+      tint: { '--ub-glow': 'rgba(2,132,199,0.55)', '--ub-soft': 'rgba(2,132,199,0.17)', '--ub-base': '#0b3a5d', '--ub-deep': '#06213a', '--ub-status': '#bae6fd' },
     },
     {
       id: 'object',
@@ -973,7 +973,7 @@ export default function App() {
       ariaLabel: 'Describe environment and detected objects',
       onClick: handleObjectButton,
       disabled: activeAction === 'object',
-      tint: { '--ub-glow': 'rgba(6,182,212,0.55)', '--ub-soft': 'rgba(6,182,212,0.17)', '--ub-base': '#06373f', '--ub-status': '#67e8f9' },
+      tint: { '--ub-glow': 'rgba(139,92,246,0.55)', '--ub-soft': 'rgba(139,92,246,0.17)', '--ub-base': '#33246e', '--ub-deep': '#1b1440', '--ub-status': '#ddd6fe' },
     },
     {
       id: 'weather',
@@ -985,7 +985,7 @@ export default function App() {
       ariaLabel: 'Get current weather report',
       onClick: handleWeatherButton,
       disabled: activeAction === 'weather',
-      tint: { '--ub-glow': 'rgba(59,130,246,0.55)', '--ub-soft': 'rgba(59,130,246,0.16)', '--ub-base': '#14346b', '--ub-status': '#93c5fd' },
+      tint: { '--ub-glow': 'rgba(245,158,11,0.55)', '--ub-soft': 'rgba(245,158,11,0.16)', '--ub-base': '#6b4410', '--ub-deep': '#3a2409', '--ub-status': '#fde68a' },
     },
     {
       id: 'ai_assist',
@@ -1001,8 +1001,8 @@ export default function App() {
       disabled: false,
       tint: isListening
         // Listening stays red on purpose — it's an alert state, not a theme colour.
-        ? { '--ub-glow': 'rgba(239,68,68,0.6)', '--ub-soft': 'rgba(239,68,68,0.18)', '--ub-base': '#4c1d1d', '--ub-status': '#fecaca' }
-        : { '--ub-glow': 'rgba(99,102,241,0.55)', '--ub-soft': 'rgba(99,102,241,0.17)', '--ub-base': '#1e2a5e', '--ub-status': '#c7d2fe' },
+        ? { '--ub-glow': 'rgba(239,68,68,0.6)', '--ub-soft': 'rgba(239,68,68,0.18)', '--ub-base': '#4c1d1d', '--ub-deep': '#2b0f0f', '--ub-status': '#fecaca' }
+        : { '--ub-glow': 'rgba(16,185,129,0.55)', '--ub-soft': 'rgba(16,185,129,0.17)', '--ub-base': '#0c5244', '--ub-deep': '#062e27', '--ub-status': '#a7f3d0' },
     },
   ]
 

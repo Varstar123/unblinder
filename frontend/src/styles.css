@@ -160,7 +160,7 @@ main{ display:grid; grid-template-columns: 1fr 360px; gap:20px; padding:18px; he
 	color:#fff;
 	background:
 		radial-gradient(130% 90% at 50% 0%, var(--ub-soft) 0%, transparent 62%),
-		linear-gradient(165deg, var(--ub-base) 0%, #062033 80%);
+		linear-gradient(165deg, var(--ub-base) 0%, var(--ub-deep) 80%);
 	transition: flex .55s cubic-bezier(.22,1,.36,1), filter .35s ease;
 }
 .ub-panel:first-child{ border-left:0 }
