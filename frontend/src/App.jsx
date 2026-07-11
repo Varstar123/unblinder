@@ -513,6 +513,9 @@ export default function App() {
   const recognitionRef = useRef(null)
   const micGrantedRef = useRef(false)
   const aiPhaseRef = useRef('idle') // Tracks 'idle' | 'listening' | 'processing'
+  // True while the mic is open because Guide Me asked "where would you like to go?" —
+  // the same mic serves the assistant, and the answer means different things.
+  const askingDestinationRef = useRef(false)
 
   const wsRef = useRef(null)
   const msgCountRef = useRef(0)
@@ -591,6 +594,15 @@ export default function App() {
         aiPhaseRef.current = 'processing'
         const text = event.results[0][0].transcript
         setIsListening(false)
+
+        // The mic serves two masters. If Guide Me asked "where would you like to go?",
+        // whatever comes back is a place, not a question — routing it through the
+        // assistant's intent classifier would only give it a chance to get that wrong.
+        if (askingDestinationRef.current) {
+          askingDestinationRef.current = false
+          handleDestinationSpoken(text)
+          return
+        }
         handleAiQuery(text)
       }
 
@@ -600,19 +612,29 @@ export default function App() {
         aiPhaseRef.current = 'idle'
         audioQueue.isAmbientSuppressed = false
 
+        const wasAskingWhereTo = askingDestinationRef.current
+
         // The user cannot see the debug log — especially on a phone, and especially
         // if they are blind. Every failure has to be audible or it did not happen.
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          askingDestinationRef.current = false
           micGrantedRef.current = false
           audioQueue.speakExplicit(
             ['Microphone access is blocked. Allow the microphone for this site in your browser settings, then try again.'],
             1.1, voiceEnabledRef)
         } else if (e.error === 'no-speech') {
-          audioQueue.speakExplicit(["I didn't hear anything. Tap the assistant and speak again."], 1.1, voiceEnabledRef)
+          // Asked where they wanted to go and heard nothing: don't just complain, do the
+          // useful half of the job anyway.
+          if (wasAskingWhereTo) destinationPromptFailed()
+          else audioQueue.speakExplicit(["I didn't hear anything. Tap the assistant and speak again."], 1.1, voiceEnabledRef)
         } else if (e.error === 'network') {
+          askingDestinationRef.current = false
           audioQueue.speakExplicit(['Speech recognition needs a network connection and could not reach it.'], 1.1, voiceEnabledRef)
         } else if (e.error !== 'aborted') {
+          askingDestinationRef.current = false
           audioQueue.speakExplicit(['The microphone failed. Please try again.'], 1.1, voiceEnabledRef)
+        } else {
+          askingDestinationRef.current = false
         }
       }
 
@@ -622,6 +644,8 @@ export default function App() {
         if (aiPhaseRef.current === 'listening') {
           aiPhaseRef.current = 'idle'
           audioQueue.isAmbientSuppressed = false
+          // onend fires without onerror when the mic simply closes having heard nothing.
+          if (askingDestinationRef.current) destinationPromptFailed()
         }
       }
     } else {
@@ -883,6 +907,7 @@ export default function App() {
   function stopGuiding(message) {
     guidingRef.current = false
     setGuiding(false)
+    askingDestinationRef.current = false
     offRouteLatchRef.current = false
     headingLatchRef.current = { since: 0, warned: false }
     hazardLatchRef.current = { text: '', at: 0 }
@@ -893,28 +918,13 @@ export default function App() {
     if (message) audioQueue.speakExplicit([message], 1.1, voiceEnabledRef)
   }
 
-  // Guide Me is a mode, not a sentence. Press once to start, again to stop, again to
-  // start — and it stays on by itself until the destination is reached.
+  // Turns guidance on. Called from the button, and from beginNavigation when a spoken
+  // destination should simply start walking the user there without a second tap.
   //
-  // A route is no longer required. Indoors there cannot be one, and refusing to help at
-  // all because OpenStreetMap has no footpath through a shopping centre would be absurd:
-  // without a destination it is still a working set of eyes.
-  function handleGuideMeButton() {
-    if (guidingRef.current) {
-      stopGuiding('Guidance stopped.')
-      return
-    }
-
-    const route = navRouteDataRef.current
-    const hasRoute = !!(route && route.checkpoints && route.checkpoints.length)
-
-    if (!runningRef.current && !hasRoute) {
-      audioQueue.speakExplicit(
-        ['I need either the camera or a destination. Start the camera, or set where you want to go.'],
-        1.1, voiceEnabledRef)
-      return
-    }
-
+  // `silentStart` suppresses the opening line: when the assistant has just said "setting
+  // a route to the station, four hundred metres", saying "guiding you" straight after is
+  // one sentence too many.
+  function startGuiding({ silentStart = false } = {}) {
     guidingRef.current = true
     setGuiding(true)
     offRouteLatchRef.current = false
@@ -924,25 +934,117 @@ export default function App() {
     setIndoor(null)
     logToConsole('[GUIDE]: guidance started.')
 
+    const route = navRouteDataRef.current
+    const hasRoute = !!(route && route.checkpoints && route.checkpoints.length)
+    const say = (line) => { if (!silentStart) audioQueue.speakExplicit([line], 1.1, voiceEnabledRef) }
+
     if (!runningRef.current) {
-      audioQueue.speakExplicit(
-        ['Guiding you. The camera is off, so I cannot see the path ahead.'], 1.1, voiceEnabledRef)
+      say('Guiding you. The camera is off, so I cannot see the path ahead.')
       return
     }
     if (!hasRoute) {
-      audioQueue.speakExplicit(
-        ['Watching the path ahead. No destination is set, so I will warn you but not guide you anywhere.'],
-        1.1, voiceEnabledRef)
+      say('Watching the path ahead. No destination is set, so I will warn you but not guide you anywhere.')
       return
     }
     if (!currentPositionRef.current) {
-      audioQueue.speakExplicit(['Guiding you. Waiting for GPS.'], 1.1, voiceEnabledRef)
+      say('Guiding you. Waiting for GPS.')
       return
     }
 
     // One briefing on the press — the user asked, and is waiting to hear something. After
     // this it goes quiet, and only speaks when something is wrong.
     speakBriefing({ explicit: true })
+  }
+
+  // No destination set? Don't make a blind user go hunting for a text field. Ask.
+  async function askForDestination() {
+    if (!recognitionRef.current) {
+      logToConsole('[GUIDE]: no speech recognition — cannot ask for a destination.')
+      audioQueue.speakExplicit(
+        ['No destination is set, and this browser cannot take voice input. Type a destination first.'],
+        1.1, voiceEnabledRef)
+      return
+    }
+
+    // Permission first, while the tap is still the current user gesture. Speaking the
+    // question and asking afterwards would put the whole utterance between the tap and
+    // getUserMedia, and stricter mobile browsers stop treating that as user-initiated.
+    if (!(await ensureMicPermission())) return
+
+    askingDestinationRef.current = true
+    audioQueue.speakExplicit(['Where would you like to go?'], 1.1, voiceEnabledRef, () => {
+      // The mic opens only once the question has finished being spoken. Open it any
+      // earlier and the microphone hears the app's own voice and tries to route to it.
+      if (!askingDestinationRef.current) return
+      try {
+        aiPhaseRef.current = 'listening'
+        audioQueue.isAmbientSuppressed = true
+        recognitionRef.current.start()
+        setIsListening(true)
+      } catch (err) {
+        askingDestinationRef.current = false
+        aiPhaseRef.current = 'idle'
+        audioQueue.isAmbientSuppressed = false
+        logToConsole(`[MIC ERROR]: ${err.message}`)
+      }
+    })
+  }
+
+  async function handleDestinationSpoken(spoken) {
+    logToConsole(`[GUIDE]: heard destination — "${spoken}"`)
+    const release = () => {
+      aiPhaseRef.current = 'idle'
+      audioQueue.isAmbientSuppressed = false
+    }
+    const routed = await beginNavigation(spoken, { autoGuide: true, onSpoken: release })
+    if (!routed) release()
+  }
+
+  // Asked for a destination and got nothing back. Still be useful: if the camera is on,
+  // fall through to watching the path, which is the whole product minus the routing.
+  function destinationPromptFailed() {
+    askingDestinationRef.current = false
+    if (!runningRef.current) {
+      audioQueue.speakExplicit(
+        ["I didn't catch a destination. Tap again to try, or type one on screen."], 1.1, voiceEnabledRef)
+      return
+    }
+    logToConsole('[GUIDE]: no destination heard — watching the path only.')
+    startGuiding()
+  }
+
+  // Guide Me is a mode, not a sentence. Press once to start, again to stop, again to
+  // start — and it stays on by itself until the destination is reached.
+  function handleGuideMeButton() {
+    if (guidingRef.current) {
+      stopGuiding('Guidance stopped.')
+      return
+    }
+
+    // Mid-question. The button means "stop whatever you are doing" at every other point
+    // in its life, so it has to mean that here too, or pressing it while it is listening
+    // would stack a second question on top of the first.
+    if (askingDestinationRef.current) {
+      askingDestinationRef.current = false
+      try { recognitionRef.current && recognitionRef.current.stop() } catch (err) { /* not started yet */ }
+      setIsListening(false)
+      aiPhaseRef.current = 'idle'
+      audioQueue.isAmbientSuppressed = false
+      audioQueue.clearAll()
+      logToConsole('[GUIDE]: destination question cancelled.')
+      return
+    }
+
+    const route = navRouteDataRef.current
+    const hasRoute = !!(route && route.checkpoints && route.checkpoints.length)
+
+    // Pressed with nowhere to go: ask, rather than refusing or silently doing half a job.
+    if (!hasRoute) {
+      askForDestination()
+      return
+    }
+
+    startGuiding()
   }
 
   // The guidance loop. Only alive while guiding, so nothing here runs — and no VLM call
@@ -1130,6 +1232,11 @@ export default function App() {
     // stricter mobile browsers require.
     if (!(await ensureMicPermission())) return
 
+    // One microphone, two callers. If Guide Me had a "where would you like to go?"
+    // outstanding, this tap supersedes it — otherwise whatever the user asks next would
+    // be handed to the geocoder as a place name and routed to.
+    askingDestinationRef.current = false
+
     actionIdRef.current += 1
     audioQueue.clearAll()
 
@@ -1176,11 +1283,16 @@ export default function App() {
         return
       }
 
-      // "Take me to the train station" — the assistant heard a destination, so
-      // set the route itself instead of just answering.
+      // "Take me to the train station" — the assistant heard a destination, so route
+      // there AND start walking them there. Someone who says "take me to" has asked to
+      // be taken; making them then find and press a second button is a non-answer.
       if (data.intent === 'navigate' && data.destination) {
         logToConsole(`[AI ASSISTANT]: Destination intent → "${data.destination}"`)
-        await beginNavigation(data.destination, { spokenPrefix: [data.response], onSpoken: release })
+        await beginNavigation(data.destination, {
+          spokenPrefix: [data.response],
+          onSpoken: release,
+          autoGuide: true,
+        })
         return
       }
 
@@ -1199,13 +1311,14 @@ export default function App() {
   // speakExplicit cancels whatever is already talking — so the assistant's
   // acknowledgement and the routing result have to go out as one utterance,
   // or the second would cut off the first.
-  async function beginNavigation(destination, { spokenPrefix = [], onSpoken } = {}) {
+  async function beginNavigation(destination, { spokenPrefix = [], onSpoken, autoGuide = false } = {}) {
     const target = (destination || '').trim()
     if (!target) return false
 
     logToConsole(`Wiping tracking metrics. Fetching grid for: "${target}"`)
     setDestinationInput(target)
     setNavRouteData(null)
+    navRouteDataRef.current = null
     setIsNavigating(false)
     // A new destination invalidates the route we were guiding along, so guidance has to
     // end here rather than keep steering the user toward the old one.
@@ -1241,8 +1354,27 @@ export default function App() {
       }
 
       setNavRouteData(routeData)
+      // Set the ref by hand as well. The effect that mirrors state into it does not run
+      // until after the next render, and startGuiding() below reads the ref *now* — it
+      // would otherwise see null and announce that no destination is set, having just
+      // been given one.
+      navRouteDataRef.current = routeData
       setIsNavigating(true)
-      speak([`New itinerary locked. Distance is ${Math.round(routeData.total_distance_meters)} meters.`])
+
+      const distanceLine = `Route set. ${Math.round(routeData.total_distance_meters)} meters to go.`
+
+      if (autoGuide) {
+        // Asked to be taken somewhere, so take them: no second tap. Guidance begins only
+        // once the confirmation has finished speaking, because starting it sooner would
+        // cancel that confirmation mid-sentence — speakExplicit preempts by design.
+        audioQueue.speakExplicit([...spokenPrefix, distanceLine], 1.1, voiceEnabledRef, () => {
+          if (onSpoken) onSpoken()
+          startGuiding({ silentStart: true })
+        })
+        return true
+      }
+
+      speak([distanceLine])
       return true
     } catch (err) {
       logToConsole(`Telemetry Exception: ${err.message}`)
@@ -1483,7 +1615,7 @@ export default function App() {
       glyph: <IconCompass />,
       title: guiding ? (indoor === true ? 'Watching…' : 'Guiding…') : 'Guide Me',
       description: !guiding
-        ? 'Guides you to your destination and then stays quiet — speaking only at a turn, when something is in your way, or when you go wrong. Tap again to stop.'
+        ? 'Guides you to your destination and then stays quiet — speaking only at a turn, when something is in your way, or when you go wrong. No destination set? It will ask you where to.'
         : indoor === true
           ? 'Indoors: no route to follow, so it watches instead. Warning about obstacles, steps, glass and anything in your path.'
           : 'Silent while you are on track. Speaks at turns, when something is in your way, and if you drift off the path.',
