@@ -287,7 +287,7 @@ export default function App() {
   const [objects, setObjects] = useState([])
   const [aiDescription, setAiDescription] = useState("Initializing environment orientation...")
   const [voiceEnabled, setVoiceEnabled] = useState(true)
-  const [running, setRunning] = useState(true)
+  const [running, setRunning] = useState(false)
   const [weatherReport, setWeatherReport] = useState("Standby for environmental telemetry...")
   const [fps, setFps] = useState(0)
 
@@ -310,7 +310,12 @@ export default function App() {
 
   const wsRef = useRef(null)
   const msgCountRef = useRef(0)
-  const imgRef = useRef(null)
+  const videoRef = useRef(null)
+  const overlayRef = useRef(null)
+  const streamRef = useRef(null)
+  const captureCanvasRef = useRef(null)
+  const inFlightRef = useRef(false)
+  const lastSentAtRef = useRef(0)
   const spokenObjectsCooldownRef = useRef({})
   const actionIdRef = useRef(0)
 
@@ -623,23 +628,110 @@ export default function App() {
     } catch (err) { logToConsole(`Telemetry Exception: ${err.message}`) }
   }
 
+  // Maps the normalized box coords the server returns onto the letterboxed
+  // rect the video actually occupies inside its element, so the overlay lines
+  // up regardless of how the panel is sized.
+  function drawOverlay(detections) {
+    const canvas = overlayRef.current
+    const video = videoRef.current
+    if (!canvas || !video || !video.videoWidth) return
+
+    const cw = canvas.clientWidth
+    const ch = canvas.clientHeight
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw
+      canvas.height = ch
+    }
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.clearRect(0, 0, cw, ch)
+    if (!detections || !detections.length) return
+
+    const scale = Math.min(cw / video.videoWidth, ch / video.videoHeight)
+    const dw = video.videoWidth * scale
+    const dh = video.videoHeight * scale
+    const ox = (cw - dw) / 2
+    const oy = (ch - dh) / 2
+
+    ctx.lineWidth = 2
+    ctx.font = '600 13px system-ui, sans-serif'
+    ctx.textBaseline = 'top'
+
+    detections.forEach((obj) => {
+      if (!obj.box) return
+      const [nx1, ny1, nx2, ny2] = obj.box
+      const x = ox + nx1 * dw
+      const y = oy + ny1 * dh
+      const w = (nx2 - nx1) * dw
+      const h = (ny2 - ny1) * dh
+
+      const color = obj.steps_away <= 3 ? '#f87171' : '#4ade80'
+      ctx.strokeStyle = color
+      ctx.strokeRect(x, y, w, h)
+
+      const label = `${obj.name} · ${obj.steps_away} steps`
+      const labelY = Math.max(y - 18, 0)
+      ctx.fillStyle = color
+      ctx.fillRect(x, labelY, ctx.measureText(label).width + 10, 18)
+      ctx.fillStyle = '#0b0f19'
+      ctx.fillText(label, x + 5, labelY + 1)
+    })
+  }
+
+  // Grabs the current video frame, JPEG-encodes it, and ships it to the backend.
+  function sendFrame() {
+    const ws = wsRef.current
+    const video = videoRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    if (!runningRef.current || !video || video.readyState < 2 || !video.videoWidth) return
+
+    let canvas = captureCanvasRef.current
+    if (!canvas) {
+      canvas = document.createElement('canvas')
+      captureCanvasRef.current = canvas
+    }
+
+    // Downscale before sending — YOLO sees 640px anyway, and this keeps the
+    // upload small enough to stay realtime on a phone connection.
+    const targetWidth = 640
+    const scale = targetWidth / video.videoWidth
+    canvas.width = targetWidth
+    canvas.height = Math.round(video.videoHeight * scale)
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    canvas.toBlob((blob) => {
+      const sock = wsRef.current
+      if (!blob || !sock || sock.readyState !== WebSocket.OPEN || inFlightRef.current) return
+      inFlightRef.current = true
+      lastSentAtRef.current = Date.now()
+      sock.send(blob)
+    }, 'image/jpeg', 0.6)
+  }
+
   useEffect(() => {
     const wsProto = BACKEND.startsWith('https') ? 'wss' : 'ws'
     const wsHost = BACKEND.replace(/^https?:/, '')
     const wsUrl = `${wsProto}:${wsHost}/ws`
 
+    let disposed = false
+
     function connect() {
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
+      ws.onopen = () => { inFlightRef.current = false }
+
       ws.onmessage = (ev) => {
         if (ws !== wsRef.current) return
+        inFlightRef.current = false
         msgCountRef.current += 1
         try {
           const data = JSON.parse(ev.data)
           if (runningRef.current) {
             const liveObjects = data.objects || []
             setObjects(liveObjects)
+            drawOverlay(liveObjects)
             if (data.description && data.description !== aiDescRef.current) { setAiDescription(data.description) }
             if (voiceEnabledRef.current) {
               const now = Date.now()
@@ -655,12 +747,41 @@ export default function App() {
         } catch (e) { console.error(e) }
       }
       ws.onerror = (e) => console.error('WS error', e)
-      ws.onclose = () => { setTimeout(connect, 1000) }
+      ws.onclose = () => {
+        inFlightRef.current = false
+        if (!disposed) setTimeout(connect, 1000)
+      }
     }
     connect()
+
+    // Only one frame is ever in flight: the next is sent when the previous
+    // one's detections come back. A slow server therefore lowers the frame
+    // rate instead of building up a backlog of stale frames.
+    const pump = setInterval(() => {
+      if (inFlightRef.current) {
+        if (Date.now() - lastSentAtRef.current > 4000) inFlightRef.current = false
+        return
+      }
+      sendFrame()
+    }, 120)
+
     const fpsI = setInterval(() => { setFps(msgCountRef.current); msgCountRef.current = 0 }, 1000)
-    return () => { clearInterval(fpsI); if (wsRef.current) wsRef.current.close() }
+    return () => {
+      disposed = true
+      clearInterval(pump)
+      clearInterval(fpsI)
+      if (wsRef.current) wsRef.current.close()
+    }
   }, [])
+
+  // The <video> only exists while running, so attach the stream once it mounts.
+  useEffect(() => {
+    const video = videoRef.current
+    if (running && video && streamRef.current && video.srcObject !== streamRef.current) {
+      video.srcObject = streamRef.current
+      video.play().catch(() => {})
+    }
+  }, [running])
 
   useEffect(() => {
     if (running && voiceEnabled && aiDescription && aiDescription !== "Initializing environment orientation...") {
@@ -669,14 +790,14 @@ export default function App() {
   }, [aiDescription, voiceEnabled, running])
 
   function snapshot() {
-    const img = imgRef.current
-    if (!img) return
+    const video = videoRef.current
+    if (!video || !video.videoWidth) return
     const canvas = document.createElement('canvas')
-    canvas.width = img.naturalWidth || img.width
-    canvas.height = img.naturalHeight || img.height
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
     const ctx = canvas.getContext('2d')
     if (ctx) {
-      ctx.drawImage(img, 0, 0)
+      ctx.drawImage(video, 0, 0)
       const url = canvas.toDataURL('image/png')
       const a = document.createElement('a')
       a.href = url
@@ -685,18 +806,44 @@ export default function App() {
     }
   }
 
+  // Pauses detection without giving up the camera permission/stream.
   function toggleRunning() {
     const nextState = !running
     setRunning(nextState)
     if (!nextState) audioQueue.clearAll()
   }
 
-  async function stopCamera() {
-    try { await fetch(`${BACKEND}/camera/stop`, { method: 'POST' }); setRunning(false); audioQueue.clearAll() } catch (err) { console.error(err) }
+  // The camera is the user's own device — on a phone this is the rear camera,
+  // which is the one actually pointed at the path ahead.
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      logToConsole('[CAMERA ERROR]: This browser exposes no camera API.')
+      return
+    }
+    try {
+      const stream = streamRef.current || await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      })
+      streamRef.current = stream
+      setRunning(true)
+      logToConsole('[SENSOR]: Camera stream acquired.')
+    } catch (err) {
+      logToConsole(`[CAMERA ERROR]: ${err.message}`)
+      audioQueue.speakExplicit(['Camera access was denied.'], 1.1, voiceEnabledRef)
+    }
   }
 
-  async function startCamera() {
-    try { await fetch(`${BACKEND}/camera/start`, { method: 'POST' }); setRunning(true) } catch (err) { console.error(err) }
+  function stopCamera() {
+    const stream = streamRef.current
+    if (stream) stream.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    if (videoRef.current) videoRef.current.srcObject = null
+    setRunning(false)
+    setObjects([])
+    drawOverlay([])
+    audioQueue.clearAll()
+    logToConsole('[SENSOR]: Camera stream released.')
   }
 
   const activeCheckpoint = navRouteData && navRouteData.checkpoints && navRouteData.checkpoints.length > 0
@@ -949,7 +1096,19 @@ return (
         <section style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           <div style={{ position: 'relative', width: '100%', aspectRatio: '16/9', background: '#000000', borderRadius: '18px', overflow: 'hidden', border: '2px solid #1f2937' }}>
             {running ? (
-              <img ref={imgRef} src={`${BACKEND}/video_feed`} alt="Optical Feed" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              <>
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000000' }}
+                />
+                <canvas
+                  ref={overlayRef}
+                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
+                />
+              </>
             ) : (
               <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                 <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#4b5563" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom: '1rem' }}><path d="M13 13v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2.5l.5-1"></path><line x1="2" y1="2" x2="22" y2="22"></line><path d="M10 5h4l2 3h4a2 2 0 0 1 2 2v7.5"></path></svg>

@@ -7,9 +7,10 @@ import urllib.request
 import urllib.parse
 from typing import List, Optional
 
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from ultralytics import YOLO
 import cv2
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Unblinder")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,121 +30,84 @@ app.add_middleware(
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Global memory states
-latest_frame = None
-latest_objects = []
-latest_stats = {"inference_ms": 0.0, "fps": 0.0}
+MODEL_PATH = os.environ.get("YOLO_MODEL", "yolo11n.pt")
+
+# The camera lives in the user's browser, not on this server. Frames arrive over
+# the /ws socket, get detected on, and the results go straight back down the same
+# socket. Nothing here ever touches a local capture device.
+model = YOLO(MODEL_PATH)
+model_lock = threading.Lock()
+
+state_lock = threading.Lock()
+latest_objects: List[dict] = []
+latest_frame_at = 0.0
 global_scene_context = "Scanning layout framework..."
 
-frame_lock = threading.Lock()
-capture_running = threading.Event()
-capture_running.set()
 
-# ==========================================
-# THREAD 1: YOLO OPTICAL ENGINE
-# ==========================================
-def capture_loop(source=0, model_path="yolo11n.pt"):
-    global latest_frame, latest_objects
-    model = YOLO(model_path)
-    cap = None
-    img_w, img_h = 640, 480
-    last_time = time.time()
-    frame_count = 0
+def run_detection(frame):
+    """Runs YOLO on one BGR frame. Returns (objects, inference_ms).
 
-    while True:
-        if not capture_running.is_set():
-            if cap is not None:
-                cap.release()
-                cap = None
-            with frame_lock:
-                latest_frame = None
-                latest_objects = []
-            time.sleep(0.2)
-            continue
+    Box coordinates come back normalized to 0..1 so the browser can draw them
+    over its own video element at whatever size it happens to be rendering.
+    """
+    img_h, img_w = frame.shape[:2]
 
-        if cap is None:
-            cap = cv2.VideoCapture(source)
-            if not cap.isOpened():
-                time.sleep(0.5)
-                continue
-            img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-            img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+    with model_lock:
+        t0 = time.time()
+        results = model(frame, verbose=False)
+        inference_ms = (time.time() - t0) * 1000.0
 
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
-
-        import contextlib
-        with open(os.devnull, 'w') as devnull:
-            with contextlib.redirect_stdout(devnull):
-                with contextlib.redirect_stderr(devnull):
-                    t0 = time.time()
-                    results = model(frame)
-                    t1 = time.time()
-        inference_ms = (t1 - t0) * 1000.0
-
+    objects = []
+    for box in results[0].boxes:
         try:
-            annotated = results[0].plot()
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            name = model.names[cls]
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+            bx_w = x2 - x1
+            bx_h = y2 - y1
+            center_x = x1 + (bx_w / 2)
+
+            position = "left" if center_x < img_w / 3 else "right" if center_x > 2 * img_w / 3 else "center"
+            height_ratio = bx_h / img_h
+            steps = 2 if height_ratio > 0.7 else 4 if height_ratio > 0.4 else 8 if height_ratio > 0.2 else 15
+
+            objects.append({
+                "name": name,
+                "confidence": round(conf, 2),
+                "position": position,
+                "steps_away": steps,
+                "box": [
+                    round(x1 / img_w, 4),
+                    round(y1 / img_h, 4),
+                    round(x2 / img_w, 4),
+                    round(y2 / img_h, 4),
+                ],
+            })
         except Exception:
-            annotated = frame
-
-        objects = []
-        for box in results[0].boxes:
-            try:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                name = model.names[cls]
-                xyxy = box.xyxy[0].tolist()
-                bx_w = xyxy[2] - xyxy[0]
-                bx_h = xyxy[3] - xyxy[1]
-                center_x = xyxy[0] + (bx_w / 2)
-
-                position = "left" if center_x < img_w / 3 else "right" if center_x > 2 * img_w / 3 else "center"
-                height_ratio = bx_h / img_h
-                steps = 2 if height_ratio > 0.7 else 4 if height_ratio > 0.4 else 8 if height_ratio > 0.2 else 15
-
-                objects.append({
-                    "name": name,
-                    "confidence": round(conf, 2),
-                    "position": position,
-                    "steps_away": steps
-                })
-            except Exception:
-                continue
-
-        ret2, jpeg = cv2.imencode('.jpg', annotated)
-        if not ret2:
             continue
 
-        with frame_lock:
-            latest_frame = jpeg.tobytes()
-            latest_objects = objects
-            latest_stats['inference_ms'] = round(inference_ms, 1)
+    return objects, inference_ms
 
-        frame_count += 1
-        now = time.time()
-        if now - last_time >= 1.0:
-            fps = frame_count / (now - last_time)
-            with frame_lock:
-                latest_stats['fps'] = round(fps, 1)
-            frame_count = 0
-            last_time = now
-        time.sleep(0.01)
 
 # ==========================================
-# THREAD 2: SCENE ANALYZER
+# SCENE ANALYZER — summarizes whatever the camera is currently looking at
 # ==========================================
 def scene_analyzer_loop():
     global global_scene_context
     time.sleep(3.0)
     while True:
-        if not capture_running.is_set():
-            time.sleep(1.0)
+        with state_lock:
+            current_objs = list(latest_objects)
+            idle = (time.time() - latest_frame_at) > 15.0
+
+        # No frames arriving means no camera is streaming; don't burn Groq calls.
+        if idle or not groq_client:
+            time.sleep(5.0)
             continue
-        with frame_lock:
-            current_objs = latest_objects.copy()
-        unique_items = list(set([obj['name'] for obj in current_objs]))
+
+        unique_items = list({obj["name"] for obj in current_objs})
         items_string = ", ".join(unique_items) if unique_items else "clear space"
 
         scene_prompt = (
@@ -152,24 +116,36 @@ def scene_analyzer_loop():
             "Keep it strictly brief, descriptive, and clean. No formatting or commentary."
         )
         try:
-            if groq_client:
-                completion = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": scene_prompt}],
-                    model="llama-3.1-8b-instant",
-                    temperature=0.2,
-                    max_tokens=25
-                )
-                clean_text = completion.choices[0].message.content.strip().replace('"', '').replace('*', '')
-                with frame_lock:
-                    global_scene_context = clean_text
+            completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": scene_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.2,
+                max_tokens=25,
+            )
+            clean_text = completion.choices[0].message.content.strip().replace('"', '').replace('*', '')
+            with state_lock:
+                global_scene_context = clean_text
         except Exception:
             pass
         time.sleep(10.0)
 
+
 @app.on_event("startup")
 def start_background_tasks():
-    threading.Thread(target=capture_loop, daemon=True).start()
     threading.Thread(target=scene_analyzer_loop, daemon=True).start()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return """<!doctype html>
+<title>Unblinder API</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0f19;color:#e5e7eb;max-width:40rem;margin:4rem auto;padding:0 1.5rem;line-height:1.6}
+code{background:#1f2937;padding:.15rem .4rem;border-radius:4px}a{color:#a855f7}</style>
+<h1>Unblinder API</h1>
+<p>This is the backend. The camera runs in the browser and streams frames to
+<code>/ws</code>, which returns YOLO detections. Open the dashboard to use it.</p>
+<p><a href="/docs">Interactive API docs &rarr;</a></p>"""
+
 
 # ==========================================
 # NAVIGATION ENDPOINTS
@@ -234,33 +210,6 @@ def calculate_walking_route(start_lat: float, start_lon: float, end_lat: float, 
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-@app.get("/video_feed")
-def video_feed():
-    return StreamingResponse(mjpeg_generator(), media_type='multipart/x-mixed-replace; boundary=frame')
-
-def mjpeg_generator():
-    boundary = b"frame"
-    while True:
-        with frame_lock:
-            frame = latest_frame
-        if frame is None:
-            time.sleep(0.05)
-            continue
-        yield b"--%b\r\n" % boundary
-        yield b"Content-Type: image/jpeg\r\n\r\n"
-        yield frame
-        yield b"\r\n"
-        time.sleep(0.03)
-
-@app.post('/camera/stop')
-def stop_camera():
-    capture_running.clear()
-    return {"status": "stopped"}
-
-@app.post('/camera/start')
-def start_camera():
-    capture_running.set()
-    return {"status": "running"}
 
 @app.get("/api/weather")
 def get_weather_report(lat: float, lon: float):
@@ -289,6 +238,55 @@ def get_weather_report(lat: float, lon: float):
         return {"success": True, "report": report}
     except Exception:
         return {"success": False, "report": "Unable to contact the spatial weather satellites right now."}
+
+
+# ==========================================
+# VOICE ASSISTANT — answers a spoken question, grounded in what the
+# camera can currently see.
+# ==========================================
+class AiQuery(BaseModel):
+    query: str
+
+
+@app.post("/api/ai_assist")
+def ai_assist(payload: AiQuery):
+    if not groq_client:
+        return {"success": False, "message": "AI reasoning engine unavailable (no GROQ_API_KEY configured)."}
+
+    with state_lock:
+        objs = list(latest_objects)
+        scene = global_scene_context
+
+    if objs:
+        seen = "; ".join(f"{o['name']} ({o['steps_away']} steps, {o['position']})" for o in objs[:8])
+    else:
+        seen = "nothing detected right now"
+
+    prompt = (
+        "You are a voice assistant for a blind user who is listening through text-to-speech. "
+        "Answer their question in 1 to 3 short sentences, under 50 words. Speak plainly and warmly, "
+        "in second person. Never use markdown, bullet points, or asterisks.\n"
+        "If the question is about their surroundings, answer using only the camera data below; "
+        "do not invent objects that are not listed. If the question is general knowledge, "
+        "just answer it normally.\n\n"
+        f"What the camera sees right now: {seen}\n"
+        f"Scene summary: {scene}\n\n"
+        f"Their question: {payload.query}"
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",
+            temperature=0.4,
+            max_tokens=120,
+        )
+        text = completion.choices[0].message.content.strip().replace("*", "").replace("#", "")
+        if not text:
+            return {"success": False, "message": "Empty response from AI reasoning engine."}
+        return {"success": True, "response": text}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 # ==========================================
@@ -379,16 +377,60 @@ def generate_fused_briefing(payload: BriefingRequest):
         return {"success": False, "message": str(e)}
 
 
+# ==========================================
+# FRAME SOCKET — the browser sends JPEG frames as binary messages and gets
+# detections back on the same socket. One reply per frame, which also gives
+# the client natural backpressure: it waits for a reply before sending the
+# next frame, so a slow server just means a lower frame rate, not a backlog.
+# ==========================================
 @app.websocket('/ws')
 async def websocket_endpoint(websocket: WebSocket):
+    global latest_objects, latest_frame_at
+
     await websocket.accept()
+    loop = asyncio.get_running_loop()
+
+    frame_count = 0
+    window_start = time.time()
+    fps = 0.0
+
     try:
         while True:
-            with frame_lock:
-                current_objs = latest_objects
-                stats = latest_stats.copy()
-                current_desc = global_scene_context
-            await websocket.send_json({"objects": current_objs, "stats": stats, "description": current_desc})
-            await asyncio.sleep(0.03)
+            data = await websocket.receive_bytes()
+
+            frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                await websocket.send_json({
+                    "objects": [],
+                    "stats": {"inference_ms": 0.0, "fps": 0.0},
+                    "description": global_scene_context,
+                    "error": "undecodable frame",
+                })
+                continue
+
+            objects, inference_ms = await loop.run_in_executor(None, run_detection, frame)
+
+            frame_count += 1
+            now = time.time()
+            if now - window_start >= 1.0:
+                fps = frame_count / (now - window_start)
+                frame_count = 0
+                window_start = now
+
+            with state_lock:
+                latest_objects = objects
+                latest_frame_at = now
+                description = global_scene_context
+
+            await websocket.send_json({
+                "objects": objects,
+                "stats": {"inference_ms": round(inference_ms, 1), "fps": round(fps, 1)},
+                "description": description,
+            })
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
+    finally:
+        with state_lock:
+            latest_objects = []

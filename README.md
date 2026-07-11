@@ -1,89 +1,87 @@
-Markdown
-# Unblinder — React dashboard + live camera stream
+# Unblinder
 
-This project runs a Python backend (FastAPI) that captures webcam frames, runs a YOLO model (`yolo11n.pt`) to annotate frames, and exposes:
+An AI walking assistant for visually impaired pedestrians. It watches the path ahead through the user's camera, detects obstacles with YOLO, fuses them with OpenStreetMap walking directions, and speaks a single calm, safety-first briefing through text-to-speech.
 
-- `/video_feed` — MJPEG stream of annotated frames
-- `/ws` — WebSocket streaming JSON detection objects
+The camera runs **in the browser**, not on the server — so on a phone, the rear camera is the one pointed at the path, and the whole thing works when deployed to the cloud.
 
-The `frontend/` directory contains a minimal Vite + React dashboard that displays the MJPEG stream and a live list of detected objects.
+## How it works
 
-Quick start (macOS):
+```
+browser camera ──JPEG frames──▶  /ws  ──▶ YOLO (yolo11n)
+     ▲                                        │
+     └────────── detections + boxes ──────────┘
 
-1. Activate your Python venv (created earlier):
+OpenStreetMap (Nominatim + OSRM) ──▶ route ──┐
+                                              ├──▶ Groq LLM ──▶ spoken briefing
+live obstacle detections ─────────────────────┘
+```
+
+The frontend captures frames, downscales them to 640px, and streams them over a WebSocket. The backend runs detection and sends back labels plus normalized bounding boxes, which the browser draws over the live video. Only one frame is in flight at a time, so a slow server lowers the frame rate rather than building a backlog of stale frames.
+
+## API
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Service info page |
+| `WS /ws` | Send JPEG frames, receive detections |
+| `POST /api/briefing` | Fuses obstacles + navigation into one spoken briefing ("Guide Me") |
+| `POST /api/ai_assist` | Answers a spoken question, grounded in what the camera sees |
+| `GET /api/weather` | Conversational weather report for someone who can't see the sky |
+| `GET /api/geocode` | Destination string → coordinates |
+| `GET /api/route` | Walking route + turn-by-turn checkpoints |
+
+Interactive docs are at `/docs`.
+
+## Setup
+
+You need Python 3.10+, Node.js, and a [Groq API key](https://console.groq.com/keys).
+
+**Model weights** are not committed. Download `yolo11n.pt` from the [Ultralytics releases](https://github.com/ultralytics/assets/releases) and put it next to `server.py`. (Ultralytics will also fetch it automatically on first run.)
+
+**Backend:**
 
 ```bash
-source .venv/bin/activate
-Install Python requirements (if you haven't already):
-
-Bash
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-Run the FastAPI server:
 
-Bash
-uvicorn server:app --host 0.0.0.0 --port 8000
-In another terminal, start the frontend dev server (requires Node.js & npm):
+cp .env.example .env           # then set GROQ_API_KEY
+uvicorn server:app --reload --port 8000
+```
 
-Bash
+Without a `GROQ_API_KEY` the server still runs, but the briefing, assistant, and scene summary degrade to plain fallbacks.
+
+**Frontend:**
+
+```bash
 cd frontend
 npm install
 npm run dev
-Open the Vite URL (usually http://localhost:5173) to see the dashboard. You can also open http://localhost:8000/ to view the simple HTML preview served by the backend.
+```
 
-Notes:
+Open the Vite URL (usually http://localhost:5173). The dashboard talks to `http://localhost:8000` by default; set `VITE_BACKEND_URL` to point it elsewhere.
 
-If your webcam device is different, edit server.py and change capture_loop(source=0) to the desired source path or index.
+Note that browsers only grant camera access on `localhost` or over HTTPS.
 
-Model weights are not committed to this repo. Download `yolo11n.pt` from the [Ultralytics releases](https://github.com/ultralytics/assets/releases) and place it in the same folder as `server.py`.
+## Deploying
 
-Copy `.env.example` to `.env` and set `GROQ_API_KEY` — the scene analyzer, weather report, and guidance briefing need it. Without a key the server still runs, but those features degrade to plain fallbacks.
+**Backend** — Render Web Service:
 
-💻 Terminal Commands Reference & Groq Integration
-Below are the exact terminal commands required to install the modern AI capabilities, troubleshoot workspace scope constraints, and initialize the enhanced codebase safely.
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn server:app --host 0.0.0.0 --port $PORT`
+- Env: `GROQ_API_KEY`
 
-1. Groq SDK Engine Installation & Verification
-Ensure your Python virtual environment (.venv) is actively engaged before launching these steps to pull down the cloud-inference packages:
+Torch and Ultralytics are heavy; the free instance type is not enough.
 
-Bash
-# 1. Download and install the core Groq cloud inference engine client
-pip install groq
+**Frontend** — Render Static Site:
 
-# 2. Install the variable parsing helper library
-pip install python-dotenv
+- Root directory: `frontend`
+- Build: `npm install && npm run build`
+- Publish directory: `dist`
+- Env: `VITE_BACKEND_URL` = your backend's URL
 
-# 3. Verify that the package tree compiled cleanly into your local workspace environment
-pip show groq
-Description: Installs the required client modules for cloud inference and configuration parsing. The final verification check prints out package metadata details to confirm the workspace environment is compiled cleanly.
+## Layout
 
-2. Resolving the "Could not import module server" Directory Error
-If your command prompt line path is sitting back at the parent directory (D:\Project\AMD_Hackathon), running your server directly will result in a path tracking failure. Step directly into your active subdirectory project boundaries first:
-
-Bash
-# Shift your active command console directly inside the core code folder
-cd unblinder
-
-# Boot up the backend interface engine smoothly from the correct path layer
-uvicorn server:app --host 0.0.0.0 --port 8000
-Description: Shifting into the specific subfolder maps the running terminal directory directly alongside server.py, which lets Uvicorn find and bind the FastAPI ASGI app module instantly.
-
-3. Activating Live Server Hot-Reload (Recommended for Quick Testing)
-To save yourself from having to manually kill your terminal screen and reboot your backend every single time you refine a prompt phrase, pass the active monitoring parameters:
-
-Bash
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-Description: Tells the ASGI engine to automatically reload within fractions of a second the very instant you save code changes in server.py.
-
-4. Initializing the Cleaned Frontend Dashboard
-Open a distinct, secondary terminal window separate from your running Python task stream, and run this sequence to light up your React/Vite layout engine interface:
-
-Bash
-# Position your shell terminal into your UI subfolder location
-cd frontend
-
-# Install clean bundle dependencies according to the package rules
-npm install
-
-# Initialize the local Vite processing development compilation engine
-npm run dev
-Description: Accesses the node client stack directory, updates compilation packages, and maps your console system interface locally onto port 5173 without layout errors.
-
+- `server.py` — FastAPI backend: detection socket, navigation, weather, LLM reasoning
+- `detect.py` — standalone local webcam script, for quickly sanity-checking the model
+- `frontend/src/App.jsx` — the dashboard: video, overlay, map, voice, and controls
