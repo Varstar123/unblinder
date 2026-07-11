@@ -488,6 +488,14 @@ export default function App() {
       setSpeechSupported(false)
       logToConsole("SpeechRecognition API not supported in this browser.")
     }
+
+    // Printed on every boot so that "the mic button does nothing" is answerable from
+    // the on-screen log alone. On a phone there is no devtools console to open, so a
+    // capability that is silently missing is otherwise indistinguishable from a bug.
+    logToConsole(
+      `[ENV]: secure=${window.isSecureContext} · getUserMedia=${!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)} · ` +
+      `speechRecognition=${!!SpeechRecognition} · build=${__BUILD_ID__}`
+    )
   }, [])
 
   useEffect(() => {
@@ -692,13 +700,37 @@ export default function App() {
   async function ensureMicPermission() {
     if (micGrantedRef.current) return true
 
+    // getUserMedia only exists in a secure context. Over plain HTTP on a phone the
+    // whole mediaDevices object is simply absent — no error, no prompt, nothing.
+    if (!window.isSecureContext) {
+      logToConsole(`[MIC ERROR]: insecure origin (${window.location.protocol}//). Camera and mic need HTTPS.`)
+      audioQueue.speakExplicit(['This page is not secure, so the microphone cannot be used. Open it over HTTPS.'], 1.1, voiceEnabledRef)
+      return false
+    }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      logToConsole('[MIC ERROR]: no microphone API in this browser.')
+      logToConsole('[MIC ERROR]: no getUserMedia in this browser.')
       audioQueue.speakExplicit(['This browser has no microphone access.'], 1.1, voiceEnabledRef)
       return false
     }
 
+    // A permission the user has already blocked does NOT re-prompt — getUserMedia just
+    // throws instantly. That looks identical to "nothing happened", so name it, or the
+    // user will keep tapping a button that can never work until they reset it by hand.
     try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const status = await navigator.permissions.query({ name: 'microphone' })
+        logToConsole(`[MIC]: permission state = ${status.state}`)
+        if (status.state === 'denied') {
+          audioQueue.speakExplicit(
+            ['The microphone is blocked for this site. Tap the lock icon next to the address bar, allow the microphone, then reload.'],
+            1.1, voiceEnabledRef)
+          return false
+        }
+      }
+    } catch (e) { /* Safari has no 'microphone' descriptor — fall through and just ask */ }
+
+    try {
+      logToConsole('[MIC]: requesting permission…')
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       stream.getTracks().forEach((track) => track.stop())
       micGrantedRef.current = true
@@ -706,8 +738,11 @@ export default function App() {
       return true
     } catch (err) {
       logToConsole(`[MIC ERROR]: ${err.name} — ${err.message}`)
+      const blocked = err.name === 'NotAllowedError' || err.name === 'SecurityError'
       audioQueue.speakExplicit(
-        ['Microphone access was denied. Allow the microphone for this site, then tap the assistant again.'],
+        [blocked
+          ? 'Microphone access was denied. Allow the microphone for this site, then tap the assistant again.'
+          : 'The microphone could not be opened. It may be in use by another app.'],
         1.1, voiceEnabledRef)
       return false
     }
